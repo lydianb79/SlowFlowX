@@ -12,6 +12,7 @@ final class MetalContext {
     let foldPipeline: MTLComputePipelineState
     let scorePipeline: MTLComputePipelineState
     let saliencePipeline: MTLComputePipelineState
+    let medianPipeline: MTLComputePipelineState
 
     static let pixelFormat: MTLPixelFormat = .bgra8Unorm
 
@@ -26,7 +27,8 @@ final class MetalContext {
                   let specFn = library.makeFunction(name: "spectrum_fragment"),
                   let foldFn = library.makeFunction(name: "fold_chroma"),
                   let scoreFn = library.makeFunction(name: "score_chords"),
-                  let salienceFn = library.makeFunction(name: "melody_salience") else { return nil }
+                  let salienceFn = library.makeFunction(name: "melody_salience"),
+                  let medianFn = library.makeFunction(name: "median_filter") else { return nil }
 
             func renderPipeline(_ fragment: MTLFunction) throws -> MTLRenderPipelineState {
                 let desc = MTLRenderPipelineDescriptor()
@@ -40,6 +42,7 @@ final class MetalContext {
             foldPipeline = try device.makeComputePipelineState(function: foldFn)
             scorePipeline = try device.makeComputePipelineState(function: scoreFn)
             saliencePipeline = try device.makeComputePipelineState(function: salienceFn)
+            medianPipeline = try device.makeComputePipelineState(function: medianFn)
         } catch {
             NSLog("SlowFlowX: Metal setup failed: \(error)")
             return nil
@@ -144,5 +147,28 @@ enum MetalCompute {
         guard cmd.status == .completed else { return nil }
         let ptr = outBuf.contents().bindMemory(to: Float.self, capacity: frames * C)
         return Array(UnsafeBufferPointer(start: ptr, count: frames * C))
+    }
+
+    static func medianFilter(_ input: [Float], frames: Int, bins: Int, alongTime: Bool, radius: Int) -> [Float]? {
+        guard let ctx = MetalContext.shared, frames > 0, bins > 0, input.count == frames * bins else { return nil }
+        let d = ctx.device
+        guard let inBuf = d.makeBuffer(bytes: input, length: input.count * 4, options: .storageModeShared),
+              let outBuf = d.makeBuffer(length: input.count * 4, options: .storageModeShared),
+              let cmd = ctx.queue.makeCommandBuffer(),
+              let enc = cmd.makeComputeCommandEncoder() else { return nil }
+        var params = SIMD4<UInt32>(UInt32(frames), UInt32(bins), alongTime ? 0 : 1, UInt32(min(max(radius, 1), 16)))
+        enc.setComputePipelineState(ctx.medianPipeline)
+        enc.setBuffer(inBuf, offset: 0, index: 0)
+        enc.setBuffer(outBuf, offset: 0, index: 1)
+        enc.setBytes(&params, length: MemoryLayout<SIMD4<UInt32>>.size, index: 2)
+        let tg = MTLSize(width: 16, height: 16, depth: 1)
+        let groups = MTLSize(width: (frames + 15) / 16, height: (bins + 15) / 16, depth: 1)
+        enc.dispatchThreadgroups(groups, threadsPerThreadgroup: tg)
+        enc.endEncoding()
+        cmd.commit()
+        cmd.waitUntilCompleted()
+        guard cmd.status == .completed else { return nil }
+        let ptr = outBuf.contents().bindMemory(to: Float.self, capacity: input.count)
+        return Array(UnsafeBufferPointer(start: ptr, count: input.count))
     }
 }

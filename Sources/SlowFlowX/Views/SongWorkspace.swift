@@ -7,34 +7,65 @@ enum LowerPane: String, CaseIterable, Identifiable {
     var icon: String { self == .chordsLyrics ? "text.quote" : "music.note.list" }
 }
 
+private struct TopSectionHeightKey: PreferenceKey {
+    static let defaultValue: CGFloat = 0
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) { value = max(value, nextValue()) }
+}
+
 struct SongWorkspace: View {
     @Environment(AppModel.self) private var model
     @Environment(\.appTheme) private var theme
     @AppStorage("lowerPane") private var paneRaw = LowerPane.chordsLyrics.rawValue
+    @State private var topHeight: CGFloat = 320
     let song: Song
+
+    /// Below this the lower panel would get cramped, so the workspace scrolls instead of overlapping.
+    private let minLowerHeight: CGFloat = 380
+    private let spacing: CGFloat = 14
 
     var body: some View {
         VStack(spacing: 0) {
-            VStack(spacing: 14) {
-                SongHeader(song: song)
-                WaveformPanel(song: song)
-                if paneRaw == LowerPane.melody.rawValue {
-                    MelodyPanel(song: song)
-                        .frame(minHeight: 0, maxHeight: .infinity)
-                } else {
-                    HStack(alignment: .top, spacing: 14) {
-                        ChordsPanel(song: song)
-                            .frame(minWidth: 380, maxWidth: .infinity)
-                        LyricsPanel(song: song)
-                            .frame(minWidth: 340, maxWidth: .infinity)
+            GeometryReader { geo in
+                let lowerHeight = max(minLowerHeight, geo.size.height - topHeight - spacing * 2)
+                ScrollView(.vertical) {
+                    VStack(spacing: spacing) {
+                        // Header, waveform and stems always keep their natural height.
+                        VStack(spacing: spacing) {
+                            SongHeader(song: song)
+                            WaveformPanel(song: song)
+                            StemMixerBar(song: song)
+                        }
+                        .fixedSize(horizontal: false, vertical: true)
+                        .background(
+                            GeometryReader { g in
+                                Color.clear.preference(key: TopSectionHeightKey.self, value: g.size.height)
+                            }
+                        )
+
+                        // The lower panel fills the remaining height (and scrolls internally).
+                        Group {
+                            if paneRaw == LowerPane.melody.rawValue {
+                                MelodyPanel(song: song)
+                            } else {
+                                HStack(alignment: .top, spacing: spacing) {
+                                    ChordsPanel(song: song)
+                                        .frame(minWidth: 380, maxWidth: .infinity, maxHeight: .infinity)
+                                    LyricsPanel(song: song)
+                                        .frame(minWidth: 340, maxWidth: .infinity, maxHeight: .infinity)
+                                }
+                            }
+                        }
+                        .frame(height: lowerHeight)
+                        .clipped()
                     }
-                    .frame(minHeight: 0, maxHeight: .infinity)
+                    .padding(.horizontal, 24)
+                    .padding(.bottom, spacing)
+                }
+                .scrollIndicators(geo.size.height - topHeight - spacing * 2 < minLowerHeight ? .automatic : .hidden)
+                .onPreferenceChange(TopSectionHeightKey.self) { h in
+                    if abs(h - topHeight) > 0.5 { topHeight = h }
                 }
             }
-            .padding(.horizontal, 24)
-            .padding(.bottom, 14)
-            .frame(minHeight: 0, maxHeight: .infinity, alignment: .top)
-            .clipped()
 
             // The transport always keeps its full height and stays pinned to the bottom.
             TransportBar(song: song)
@@ -113,6 +144,9 @@ private struct SongHeader: View {
                 Button("Transcribe Lyrics from Audio") { model.transcribeLyrics(song.id) }
                 Divider()
                 Button("Export WAV…") { model.showExportSheet = true }
+                Divider()
+                Button("Separate Stems (Demucs)") { model.separateStems(song.id, engine: .demucs) }
+                Button("Separate Stems (Built-in)") { model.separateStems(song.id, engine: .builtin) }
                 Divider()
                 Button("Show in Finder") { model.revealInFinder(song.id) }
                 Button("Open on YouTube") { model.openSource(song.id) }

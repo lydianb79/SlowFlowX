@@ -34,6 +34,15 @@ SlowFlowX downloads the audio of a song and detects its chords on the GPU with *
 - **Chords in this song**: a strip showing every chord the song uses, with its shape.
 - A **chord grid** you can click to jump to a chord. Right-click a chord to loop it.
 
+### Stem separation
+- **Split any song into stems**: vocals, drums, bass, guitar, piano and other.
+  - **Demucs (AI, recommended)**: Meta AI Research's open-source separator runs locally and uses the GPU (MPS) on Apple Silicon. You can choose between a 6-stem, a 4-stem or a fine-tuned 4-stem model in Settings › Stems.
+  - **Built-in (quick)**: no extra software is needed. It separates the stereo centre and splits sustained sounds from drum hits, using a **Metal median-filter kernel**. You get 4 stems at lower quality.
+- **Stem mixer** under the waveform: mute, solo or set the volume of each stem while playing.
+  - All stems stay sample-locked, and speed, transpose and loops still apply.
+  - Right-click a stem for **Solo only** or **Everything except** (a karaoke or play-along backing track).
+- **Better transcriptions**: each part is transcribed from its isolated stem when one exists (vocal melody → vocals, bass → bass, lead and rhythm → guitar). On-device lyric transcription uses the vocals stem.
+
 ### Tab & notes (riffs and melodies)
 - **Melody transcription**: pick the **vocal melody**, a **lead guitar riff**, the **rhythm guitar** or the **bass line**, and SlowFlowX transcribes it.
   - The **`melody_salience` Metal compute kernel** scores how strong every possible pitch is in each 12 ms frame. It sums the harmonics and suppresses octave errors.
@@ -73,11 +82,16 @@ SlowFlowX downloads the audio of a song and detects its chords on the GPU with *
 - A **live spectrum analyser** (Metal) fed from an audio-engine tap.
 
 ### Export
-- **Export WAV** of the whole song or the selected section.
+- **Export WAV** of the whole song or the selected section, with the audio you choose:
+  - the **original mix**,
+  - **selected stems mixed into one WAV**, optionally at your mixer volumes (e.g. a backing track without vocals),
+  - or **one WAV per stem** written into a folder.
+  - If the song has no stems yet, you can start separation right from the export dialog. The stems show up there when it finishes.
 - Optionally with your current speed and transpose applied (pitch preserved). Useful as a practice track for your phone.
 - 16- or 24-bit. Rendering runs offline, faster than real time.
 
 ### Look & feel
+- **Adaptive layout**: the header, waveform and stem mixer always keep their full height, and the Chords & Lyrics or Tab & Notes panel fills the rest. On small windows the workspace scrolls instead of squeezing, and the transport bar stays pinned to the bottom.
 - Native SwiftUI with **7 themes**: Midnight, Aurora, Ember, Ocean, Graphite, Paper (light) and Sakura (light).
 - A custom app icon.
 
@@ -90,6 +104,15 @@ SlowFlowX downloads the audio of a song and detects its chords on the GPU with *
 ```bash
 brew install yt-dlp ffmpeg
 ```
+
+- Optional, for high-quality stem separation: [Demucs](https://github.com/facebookresearch/demucs)
+
+```bash
+brew install uv
+uv tool install --python 3.12 demucs --with "torch==2.8.*" --with "torchaudio==2.8.*"
+```
+
+  Use Python 3.12, because some dependencies have no builds for the newest Python yet. Pin torch and torchaudio to 2.8, because torchaudio 2.9+ saves audio through TorchCodec, which breaks Demucs' output. With pipx instead: `pipx install --python python3.12 demucs && pipx inject demucs "torch==2.8.*" "torchaudio==2.8.*"`.
 
 ## Build & run
 
@@ -127,15 +150,16 @@ The Metal shaders are compiled at runtime from `MetalShaders.swift`. You don't n
 ```
 Sources/SlowFlowX/
   App/        SlowFlowXApp (scene, menus, key monitor), AppModel (state & workflows)
-  Audio/      PlaybackEngine (AVAudioEngine + TimePitch), SpectrumTap (live FFT),
-              AudioExporter (offline WAV render)
+  Audio/      PlaybackEngine (multi-stem AVAudioEngine + TimePitch), SpectrumTap (live FFT),
+              AudioExporter (offline WAV render of the mix or any stems)
   Analysis/   AudioLoader (decode/resample), ChordAnalyzer (STFT → chroma → Viterbi, key, tempo),
               MelodyAnalyzer (harmonic salience → pitch tracking → notes, strums),
               OnsetDetector (attacks, beat position)
   Models/     Song/chord/lyrics models, Melody (notes, tab fingering, MIDI & text-tab export)
   Metal/      MetalShaders (MSL source), MetalContext (pipelines + GPU compute),
               MetalViews (waveform & spectrum renderers, mouse/trackpad handling)
-  Services/   YouTubeDownloader (yt-dlp), LyricsService (LRCLIB + Speech), ProcessRunner
+  Services/   YouTubeDownloader (yt-dlp), LyricsService (LRCLIB + Speech), ProcessRunner,
+              StemSeparator (Demucs runner + built-in Metal-accelerated separator)
   Theme/      Theme definitions + ThemeStore
   Views/      Sidebar, import bar, workspace & waveform, chords panel, chord diagrams,
               lyrics, melody tab & piano roll, transport, export sheet, settings
@@ -143,7 +167,7 @@ Resources/    Info.plist, AppIcon.icns, AppIcon.iconset, AppIcon-1024.png
 Scripts/      build_app.sh
 ```
 
-Your library (audio and analysis) is stored in `~/Library/Application Support/SlowFlowX/`.
+Your library (audio, stems and analysis) is stored in `~/Library/Application Support/SlowFlowX/`.
 
 ## Troubleshooting
 
@@ -151,13 +175,16 @@ Your library (audio and analysis) is stored in `~/Library/Application Support/Sl
 - **"yt-dlp was not found"**: install it with Homebrew, then click *Re-check* on the start screen or in Settings › Tools.
 - **No lyrics found**: use the 🔍 button in the Lyrics panel to search by exact artist and title, or transcribe from the audio.
 - **Bars or note lengths look shifted**: use ½× / 2× if the tempo is off. Then pause on a clear downbeat and press **Beat Here**. Parts transcribed with an older version show an **Update Transcription** button.
-- **Messy tab / notes**: try another part (Vocal, Lead or Bass). Transcription follows whichever part is loudest in its range, so busy mixes produce stray notes. Slowing down doesn't affect the transcription, but it makes checking by ear much easier.
+- **Demucs won't install** (Rust / PyO3 / "Python version is newer than … supported"): install with Python 3.12 as shown under Requirements.
+- **Demucs fails or is slow**: make sure `demucs` runs in Terminal (`demucs --help`). A TorchCodec error means torchaudio is too new, so reinstall with the 2.8 pins. The first run downloads the model. If the GPU fails, SlowFlowX retries on the CPU, which is slower. The built-in separator always works.
+- **Messy tab / notes**: separate the stems first, then use **Transcribe from Stem**. try another part (Vocal, Lead or Bass). Transcription follows whichever part is loudest in its range, so busy mixes produce stray notes. Slowing down doesn't affect the transcription, but it makes checking by ear much easier.
 - **Wrong chords**: automatic recognition is an estimate. It is very good for practice charts, but dense mixes, heavy distortion or jazz voicings will cause errors. Use the chord grid together with your ears.
 
 ## Credits
 
 - Audio download: [yt-dlp](https://github.com/yt-dlp/yt-dlp) and [FFmpeg](https://ffmpeg.org)
 - Synced lyrics: [LRCLIB](https://lrclib.net)
+- AI stem separation: [Demucs](https://github.com/facebookresearch/demucs) (Meta AI Research)
 - Time-stretching, speech recognition and DSP: Apple AVFoundation, Speech and Accelerate
 
 ## Notice

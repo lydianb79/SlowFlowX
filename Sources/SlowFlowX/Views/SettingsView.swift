@@ -5,11 +5,14 @@ struct SettingsView: View {
     @Environment(ThemeStore.self) private var themes
     @Environment(\.appTheme) private var theme
     @AppStorage("chordDiagramStyle") private var diagramStyle = ChordDiagramStyle.piano.rawValue
+    @AppStorage("demucsModel") private var demucsModel = DemucsModel.sixStem.rawValue
 
     var body: some View {
         TabView {
             appearance
                 .tabItem { Label("Appearance", systemImage: "paintpalette") }
+            stems
+                .tabItem { Label("Stems", systemImage: "slider.vertical.3") }
             ScrollView { ToolsStatusCard().padding(20) }
                 .tabItem { Label("Tools", systemImage: "wrench.and.screwdriver") }
             about
@@ -43,6 +46,32 @@ struct SettingsView: View {
                 .pickerStyle(.segmented)
                 .labelsHidden()
                 .frame(width: 260)
+            }
+            .padding(20)
+        }
+    }
+
+    private var stems: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 14) {
+                Text("Demucs model")
+                    .font(.system(size: 15, weight: .semibold))
+                    .foregroundStyle(theme.textColor)
+                Picker("Demucs model", selection: $demucsModel) {
+                    ForEach(DemucsModel.allCases) { m in
+                        Text(m.label).tag(m.rawValue)
+                    }
+                }
+                .pickerStyle(.radioGroup)
+                .labelsHidden()
+                Text("Demucs (by Meta AI Research) runs locally on your Mac and uses the GPU on Apple Silicon. A 4-minute song takes roughly 30 s – 2 min. The first run downloads the model (~80–300 MB).")
+                    .font(.system(size: 12))
+                    .foregroundStyle(theme.subtextColor)
+                    .fixedSize(horizontal: false, vertical: true)
+                Text("The built-in separator needs no installation but is much less clean: it splits the stereo centre (vocals) from the sides and sustained sounds from drum hits.")
+                    .font(.system(size: 12))
+                    .foregroundStyle(theme.subtextColor)
+                    .fixedSize(horizontal: false, vertical: true)
             }
             .padding(20)
         }

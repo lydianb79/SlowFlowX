@@ -1,18 +1,26 @@
 import AVFoundation
 import Observation
 
-/// Audio playback with independent speed and pitch control.
-/// AVAudioUnitTimePitch performs a phase-vocoder time-stretch, so changing `rate`
-/// slows the music down without changing its pitch (and `pitch` transposes without changing tempo).
+/// Audio playback with independent speed and pitch control, playing either the original mix or a set
+/// of separated stems in sample-accurate sync (each stem can be muted, soloed or re-balanced).
+///
+/// Graph:  player(s) → submix → AVAudioUnitTimePitch → mainMixer → output
+/// The time-pitch unit performs a phase-vocoder time-stretch, so `rate` slows the music down without
+/// changing its pitch (and `pitch` transposes without changing tempo).
 @Observable
 final class PlaybackEngine {
+    private struct Source {
+        let key: String            // "mix" or StemKind.rawValue
+        let player: AVAudioPlayerNode
+        let file: AVAudioFile
+        var sampleRate: Double { file.processingFormat.sampleRate }
+    }
+
     @ObservationIgnored private let engine = AVAudioEngine()
-    @ObservationIgnored private let player = AVAudioPlayerNode()
+    @ObservationIgnored private let submix = AVAudioMixerNode()
     @ObservationIgnored private let timePitch = AVAudioUnitTimePitch()
-    @ObservationIgnored private var file: AVAudioFile?
-    @ObservationIgnored private var sampleRate: Double = 44_100
-    @ObservationIgnored private var lengthFrames: AVAudioFramePosition = 0
-    @ObservationIgnored private var segmentStartFrame: AVAudioFramePosition = 0
+    @ObservationIgnored private var sources: [Source] = []
+    @ObservationIgnored private var segmentStartTime: Double = 0
     @ObservationIgnored private var isScheduled = false
     @ObservationIgnored private var scheduleToken = 0
     @ObservationIgnored private var timer: Timer?
@@ -30,11 +38,16 @@ final class PlaybackEngine {
     private(set) var loopStart: Double?
     private(set) var loopEnd: Double?
 
+    /// Stems currently loaded (empty when playing the original mix).
+    private(set) var stemKinds: [StemKind] = []
+    private(set) var mix: [StemKind: StemMixState] = [:]
+    var usingStems: Bool { !stemKinds.isEmpty }
+
     init() {
-        engine.attach(player)
+        engine.attach(submix)
         engine.attach(timePitch)
-        timePitch.overlap = 12          // a bit smoother than the default 8
-        player.volume = volume
+        timePitch.overlap = 12
+        submix.outputVolume = volume
         let tap = spectrum
         engine.mainMixerNode.installTap(onBus: 0, bufferSize: 2048, format: nil) { buffer, _ in
             tap.process(buffer)
@@ -54,23 +67,73 @@ final class PlaybackEngine {
 
     // MARK: Loading
 
+    /// Plays the original mix.
     func load(url: URL) throws {
+        try load(tracks: [("mix", url)])
+        stemKinds = []
+        mix = [:]
+    }
+
+    /// Plays separated stems in sync. Keeps the position/loop when switching from the mix.
+    func loadStems(_ stems: [(StemKind, URL)], keepPosition: Bool = true) throws {
+        guard !stems.isEmpty else { return }
+        let t = currentTime, wasPlaying = isPlaying
+        let a = loopStart, b = loopEnd, looping = loopEnabled
+        try load(tracks: stems.map { ($0.0.rawValue, $0.1) })
+        stemKinds = stems.map(\.0)
+        var newMix: [StemKind: StemMixState] = [:]
+        for k in stemKinds { newMix[k] = mix[k] ?? StemMixState() }
+        mix = newMix
+        applyMix()
+        if keepPosition {
+            loopStart = a; loopEnd = b; loopEnabled = looping
+            seek(to: t)
+            if wasPlaying { play() }
+        }
+    }
+
+    /// Switches back from stems to the original mix, keeping the position.
+    func switchToMix(url: URL) throws {
+        let t = currentTime, wasPlaying = isPlaying
+        let a = loopStart, b = loopEnd, looping = loopEnabled
+        try load(url: url)
+        loopStart = a; loopEnd = b; loopEnabled = looping
+        seek(to: t)
+        if wasPlaying { play() }
+    }
+
+    private func load(tracks: [(String, URL)]) throws {
         stopInternal()
         engine.stop()
-        let f = try AVAudioFile(forReading: url)
-        file = f
-        sampleRate = f.processingFormat.sampleRate
-        lengthFrames = f.length
-        duration = Double(f.length) / sampleRate
+        for s in sources {
+            engine.disconnectNodeOutput(s.player)
+            engine.detach(s.player)
+        }
+        sources = []
+        engine.disconnectNodeOutput(submix)
+        engine.disconnectNodeOutput(timePitch)
+
+        var newSources: [Source] = []
+        for (key, url) in tracks {
+            let f = try AVAudioFile(forReading: url)
+            let p = AVAudioPlayerNode()
+            engine.attach(p)
+            engine.connect(p, to: submix, format: f.processingFormat)
+            newSources.append(Source(key: key, player: p, file: f))
+        }
+        sources = newSources
+        guard let first = sources.first else { return }
+
+        let sr = first.sampleRate
+        guard let busFormat = AVAudioFormat(standardFormatWithSampleRate: sr, channels: 2) else { return }
+        engine.connect(submix, to: timePitch, format: busFormat)
+        engine.connect(timePitch, to: engine.mainMixerNode, format: busFormat)
+
+        duration = sources.map { Double($0.file.length) / $0.sampleRate }.max() ?? 0
         currentTime = 0
-        segmentStartFrame = 0
+        segmentStartTime = 0
         isScheduled = false
         loopStart = nil; loopEnd = nil; loopEnabled = false
-
-        engine.disconnectNodeOutput(player)
-        engine.disconnectNodeOutput(timePitch)
-        engine.connect(player, to: timePitch, format: f.processingFormat)
-        engine.connect(timePitch, to: engine.mainMixerNode, format: f.processingFormat)
         engine.prepare()
         try engine.start()
         isLoaded = true
@@ -79,17 +142,71 @@ final class PlaybackEngine {
     func unload() {
         stopInternal()
         engine.stop()
-        file = nil
+        for s in sources {
+            engine.disconnectNodeOutput(s.player)
+            engine.detach(s.player)
+        }
+        sources = []
+        stemKinds = []
+        mix = [:]
         isLoaded = false
         duration = 0
         currentTime = 0
         spectrum.reset()
     }
 
+    // MARK: Stem mixer
+
+    func toggleMute(_ k: StemKind) { mix[k, default: StemMixState()].muted.toggle(); applyMix() }
+
+    func toggleSolo(_ k: StemKind) { mix[k, default: StemMixState()].solo.toggle(); applyMix() }
+
+    func setStemVolume(_ k: StemKind, _ v: Float) {
+        mix[k, default: StemMixState()].volume = min(max(v, 0), 1.5)
+        applyMix()
+    }
+
+    /// Only this stem audible ("practise along with just the bass").
+    func soloOnly(_ k: StemKind) {
+        for key in stemKinds { mix[key, default: StemMixState()].solo = (key == k); mix[key]?.muted = false }
+        applyMix()
+    }
+
+    /// Everything except this stem ("play along / karaoke").
+    func muteOnly(_ k: StemKind) {
+        for key in stemKinds { mix[key, default: StemMixState()].muted = (key == k); mix[key]?.solo = false }
+        applyMix()
+    }
+
+    func resetMix() {
+        for key in stemKinds { mix[key] = StemMixState() }
+        applyMix()
+    }
+
+    func effectiveGain(_ k: StemKind) -> Float {
+        guard let s = mix[k] else { return 1 }
+        let anySolo = mix.values.contains { $0.solo }
+        if anySolo { return s.solo ? s.volume : 0 }
+        return s.muted ? 0 : s.volume
+    }
+
+    /// Current per-stem gains (for exporting exactly what you hear).
+    var currentGains: [StemKind: Float] {
+        var g: [StemKind: Float] = [:]
+        for k in stemKinds { g[k] = effectiveGain(k) }
+        return g
+    }
+
+    private func applyMix() {
+        for s in sources {
+            if let k = StemKind(rawValue: s.key) { s.player.volume = effectiveGain(k) } else { s.player.volume = 1 }
+        }
+    }
+
     // MARK: Transport
 
     func play() {
-        guard file != nil else { return }
+        guard !sources.isEmpty else { return }
         do {
             if !engine.isRunning { try engine.start() }
         } catch {
@@ -97,8 +214,8 @@ final class PlaybackEngine {
             return
         }
         if currentTime >= duration - 0.05 { currentTime = 0; isScheduled = false }
-        if !isScheduled { schedule(from: frame(for: currentTime)) }
-        player.play()
+        if !isScheduled { schedule(from: currentTime) }
+        startAllInSync()
         isPlaying = true
         startTimer()
     }
@@ -106,7 +223,7 @@ final class PlaybackEngine {
     func pause() {
         guard isPlaying else { return }
         updateTime()
-        player.pause()
+        for s in sources { s.player.pause() }
         isPlaying = false
         stopTimer()
     }
@@ -114,12 +231,12 @@ final class PlaybackEngine {
     func togglePlayPause() { isPlaying ? pause() : play() }
 
     func seek(to time: Double) {
-        guard file != nil else { return }
+        guard !sources.isEmpty else { return }
         let t = max(0, min(time, duration))
         let wasPlaying = isPlaying
-        schedule(from: frame(for: t))
+        schedule(from: t)
         currentTime = t
-        if wasPlaying { player.play() }
+        if wasPlaying { startAllInSync() }
     }
 
     func skip(by seconds: Double) { seek(to: currentTime + seconds) }
@@ -138,7 +255,7 @@ final class PlaybackEngine {
 
     func setVolume(_ v: Float) {
         volume = min(max(v, 0), 1)
-        player.volume = volume
+        submix.outputVolume = volume
     }
 
     // MARK: Looping
@@ -175,27 +292,39 @@ final class PlaybackEngine {
 
     // MARK: Internals
 
-    private func frame(for time: Double) -> AVAudioFramePosition {
-        AVAudioFramePosition(time * sampleRate)
+    /// Starts every player at the same host time so stems stay sample-aligned.
+    private func startAllInSync() {
+        guard !sources.isEmpty else { return }
+        if sources.count == 1 {
+            sources[0].player.play()
+            return
+        }
+        let start = AVAudioTime(hostTime: mach_absolute_time() + AVAudioTime.hostTime(forSeconds: 0.06))
+        for s in sources { s.player.play(at: start) }
     }
 
-    private func schedule(from start: AVAudioFramePosition) {
-        guard let file else { return }
+    private func schedule(from time: Double) {
         scheduleToken &+= 1
         let token = scheduleToken
-        player.stop()
-        let s = max(0, min(start, lengthFrames))
-        segmentStartFrame = s
-        let remaining = lengthFrames - s
-        guard remaining > 0 else { isScheduled = false; return }
-        player.scheduleSegment(file, startingFrame: s, frameCount: AVAudioFrameCount(remaining), at: nil,
-                               completionCallbackType: .dataPlayedBack) { [weak self] _ in
-            DispatchQueue.main.async {
-                guard let self, self.scheduleToken == token else { return }
-                self.playbackReachedEnd()
+        for s in sources { s.player.stop() }
+        segmentStartTime = max(0, min(time, duration))
+        var any = false
+        for (i, s) in sources.enumerated() {
+            let startFrame = AVAudioFramePosition(segmentStartTime * s.sampleRate)
+            let remaining = s.file.length - startFrame
+            guard remaining > 0 else { continue }
+            any = true
+            let isReference = i == 0
+            s.player.scheduleSegment(s.file, startingFrame: startFrame, frameCount: AVAudioFrameCount(remaining),
+                                     at: nil, completionCallbackType: .dataPlayedBack) { [weak self] _ in
+                guard isReference else { return }
+                DispatchQueue.main.async {
+                    guard let self, self.scheduleToken == token else { return }
+                    self.playbackReachedEnd()
+                }
             }
         }
-        isScheduled = true
+        isScheduled = any
     }
 
     private func playbackReachedEnd() {
@@ -203,7 +332,7 @@ final class PlaybackEngine {
             seek(to: a)
             return
         }
-        player.stop()
+        for s in sources { s.player.stop() }
         isScheduled = false
         isPlaying = false
         currentTime = duration
@@ -211,10 +340,10 @@ final class PlaybackEngine {
     }
 
     private func updateTime() {
-        guard isPlaying,
-              let nodeTime = player.lastRenderTime, nodeTime.isSampleTimeValid,
-              let pt = player.playerTime(forNodeTime: nodeTime) else { return }
-        let t = Double(segmentStartFrame) / sampleRate + Double(pt.sampleTime) / pt.sampleRate
+        guard isPlaying, let ref = sources.first?.player,
+              let nodeTime = ref.lastRenderTime, nodeTime.isSampleTimeValid,
+              let pt = ref.playerTime(forNodeTime: nodeTime) else { return }
+        let t = segmentStartTime + max(0, Double(pt.sampleTime)) / pt.sampleRate
         currentTime = max(0, min(t, duration))
         if loopEnabled, let a = loopStart, let b = loopEnd, b > a, currentTime >= b {
             seek(to: a)
@@ -237,14 +366,13 @@ final class PlaybackEngine {
 
     private func stopInternal() {
         scheduleToken &+= 1
-        player.stop()
+        for s in sources { s.player.stop() }
         isScheduled = false
         isPlaying = false
         stopTimer()
     }
 
     private func handleConfigurationChange() {
-        // Output device changed (e.g. headphones unplugged): the engine stopped itself.
         let wasPlaying = isPlaying
         let t = currentTime
         stopInternal()

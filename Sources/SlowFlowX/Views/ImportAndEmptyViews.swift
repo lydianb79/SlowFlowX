@@ -157,6 +157,23 @@ struct ToolsStatusCard: View {
             }
             row(name: "yt-dlp", detail: "downloads audio from YouTube (required)", path: model.tools.ytdlp)
             row(name: "ffmpeg", detail: "converts any stream to M4A (recommended)", path: model.tools.ffmpeg)
+            row(name: "demucs", detail: "AI stem separation (optional, recommended)", path: model.tools.demucs)
+            if model.tools.demucs == nil {
+                HStack {
+                    Text(StemSeparator.installCommand)
+                        .font(.system(size: 12, design: .monospaced))
+                        .foregroundStyle(theme.textColor)
+                        .textSelection(.enabled)
+                    Spacer()
+                    Button("Copy") {
+                        NSPasteboard.general.clearContents()
+                        NSPasteboard.general.setString(StemSeparator.installCommand, forType: .string)
+                    }
+                    .buttonStyle(GhostButtonStyle())
+                }
+                .padding(10)
+                .background(RoundedRectangle(cornerRadius: 8).fill(theme.elevatedColor))
+            }
             if model.tools.ytdlp == nil || model.tools.ffmpeg == nil {
                 HStack {
                     Text("brew install yt-dlp ffmpeg")

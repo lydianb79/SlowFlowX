@@ -97,6 +97,8 @@ struct MelodyTrack: Codable, Hashable {
     var beatOffset: Double? = nil
     /// Rhythm part only.
     var strums: [Strum]? = nil
+    /// Stem the part was transcribed from (nil = full mix).
+    var stemUsed: String? = nil
 
     var isEmpty: Bool { source.isRhythm ? (strums ?? []).isEmpty : notes.isEmpty }
     var eventCount: Int { source.isRhythm ? (strums ?? []).count : notes.count }

@@ -23,6 +23,7 @@ struct AppAlert: Identifiable {
 struct ToolStatus {
     var ytdlp: URL?
     var ffmpeg: URL?
+    var demucs: URL?
 }
 
 @MainActor
@@ -41,12 +42,17 @@ final class AppModel {
     var showExportSheet = false
     /// Progress of melody transcriptions, keyed by "songID|source".
     var melodyStatus: [String: AnalysisStatus] = [:]
+    /// Stem-separation progress keyed by song id.
+    var stemStatus: [String: AnalysisStatus] = [:]
+    /// Play separated stems (when available) instead of the original mix.
+    private(set) var playStems: Bool = UserDefaults.standard.object(forKey: "playStems") as? Bool ?? true
 
     @ObservationIgnored let player = PlaybackEngine()
     @ObservationIgnored private let downloader = YouTubeDownloader()
     @ObservationIgnored private var importTask: Task<Void, Never>?
     @ObservationIgnored private var exportWork: Task<Void, Error>?
     @ObservationIgnored private var peaksLoading: Set<String> = []
+    @ObservationIgnored private var stemTasks: [String: Task<Void, Never>] = [:]
 
     init() {
         songs = LibraryStore.load().filter { FileManager.default.fileExists(atPath: $0.audioURL.path) }
@@ -61,7 +67,8 @@ final class AppModel {
     var transpose: Int { player.pitchSemitones }
 
     func refreshTools() {
-        tools = ToolStatus(ytdlp: ToolLocator.find("yt-dlp"), ffmpeg: ToolLocator.find("ffmpeg"))
+        tools = ToolStatus(ytdlp: ToolLocator.find("yt-dlp"), ffmpeg: ToolLocator.find("ffmpeg"),
+                           demucs: ToolLocator.find("demucs"))
     }
 
     // MARK: Selection
@@ -72,6 +79,7 @@ final class AppModel {
         guard let song = selectedSong else { player.unload(); return }
         do {
             try player.load(url: song.audioURL)
+            if playStems, song.stems != nil { loadStemsIntoPlayer(song) }
         } catch {
             show("Couldn't open audio", error.localizedDescription)
         }
@@ -202,7 +210,8 @@ final class AppModel {
     func transcribeLyrics(_ id: String) {
         guard let song = songs.first(where: { $0.id == id }), !lyricsLoading.contains(id) else { return }
         lyricsLoading.insert(id)
-        let url = song.audioURL
+        let url = song.stems?.url(.vocals, songID: id)
+            .flatMap { FileManager.default.fileExists(atPath: $0.path) ? $0 : nil } ?? song.audioURL
         Task {
             do {
                 let lyrics = try await LyricsService.transcribe(url: url)
@@ -222,10 +231,14 @@ final class AppModel {
         let key = Self.melodyKey(id, source)
         guard let song = songs.first(where: { $0.id == id }), melodyStatus[key] == nil else { return }
         melodyStatus[key] = AnalysisStatus(stage: "Preparing", progress: 0)
-        let url = song.audioURL
+        // Transcribe from the isolated stem when one exists (much more accurate than the full mix).
+        let stemKind = song.stems?.bestStem(for: source)
+        let url = stemKind.flatMap { song.stems?.url($0, songID: id) }
+            .flatMap { FileManager.default.fileExists(atPath: $0.path) ? $0 : nil } ?? song.audioURL
+        let usedStem = url == song.audioURL ? nil : stemKind?.rawValue
         Task {
             do {
-                let track = try await Task.detached(priority: .userInitiated) {
+                var track = try await Task.detached(priority: .userInitiated) {
                     try MelodyAnalyzer().analyze(url: url, source: source) { stage, p in
                         Task { @MainActor in
                             if self.melodyStatus[key] != nil {
@@ -234,6 +247,7 @@ final class AppModel {
                         }
                     }
                 }.value
+                track.stemUsed = usedStem
                 update(id) { song in
                     var m = song.melodies ?? [:]
                     m[source.rawValue] = track
@@ -319,9 +333,100 @@ final class AppModel {
         }
     }
 
+    // MARK: Stems
+
+    func separateStems(_ id: String, engine: StemEngine) {
+        guard let song = songs.first(where: { $0.id == id }), stemStatus[id] == nil else { return }
+        refreshTools()
+        if engine == .demucs && tools.demucs == nil {
+            show("Demucs not installed", StemError.demucsMissing.errorDescription ?? "")
+            return
+        }
+        stemStatus[id] = AnalysisStatus(stage: engine == .demucs ? "Starting Demucs…" : "Separating", progress: 0)
+        let input = song.audioURL
+        let model = DemucsModel.current
+        let task = Task {
+            do {
+                let set: StemSet
+                switch engine {
+                case .demucs:
+                    set = try await StemSeparator.separateWithDemucs(input: input, songID: id, model: model) { p in
+                        Task { @MainActor in
+                            if self.stemStatus[id] != nil {
+                                self.stemStatus[id] = AnalysisStatus(stage: "Separating with Demucs (\(model.rawValue))", progress: p)
+                            }
+                        }
+                    }
+                case .builtin:
+                    set = try await Task.detached(priority: .userInitiated) {
+                        try StemSeparator.separateBuiltin(input: input, songID: id) { p in
+                            Task { @MainActor in
+                                if self.stemStatus[id] != nil {
+                                    self.stemStatus[id] = AnalysisStatus(stage: "Separating (built-in, Metal)", progress: p)
+                                }
+                            }
+                        }
+                    }.value
+                }
+                try Task.checkCancellation()
+                update(id) { $0.stems = set }
+                if selectedID == id, playStems, let s = songs.first(where: { $0.id == id }) { loadStemsIntoPlayer(s) }
+            } catch is CancellationError {
+                // cancelled by the user
+            } catch {
+                show("Stem separation failed", error.localizedDescription)
+            }
+            stemStatus[id] = nil
+            stemTasks[id] = nil
+        }
+        stemTasks[id] = task
+    }
+
+    func cancelStemSeparation(_ id: String) {
+        stemTasks[id]?.cancel()
+        stemTasks[id] = nil
+        stemStatus[id] = nil
+    }
+
+    func deleteStems(_ id: String) {
+        guard let song = songs.first(where: { $0.id == id }) else { return }
+        if selectedID == id && player.usingStems { try? player.switchToMix(url: song.audioURL) }
+        StemSeparator.clear(LibraryPaths.stems(id))
+        update(id) { $0.stems = nil }
+    }
+
+    func setPlayStems(_ on: Bool) {
+        playStems = on
+        UserDefaults.standard.set(on, forKey: "playStems")
+        guard let song = selectedSong else { return }
+        if on, song.stems != nil {
+            loadStemsIntoPlayer(song)
+        } else if !on, player.usingStems {
+            do { try player.switchToMix(url: song.audioURL) } catch { show("Couldn't open audio", error.localizedDescription) }
+        }
+    }
+
+    private func loadStemsIntoPlayer(_ song: Song) {
+        guard let set = song.stems else { return }
+        let tracks: [(StemKind, URL)] = set.kinds.compactMap { k in
+            guard let u = set.url(k, songID: song.id), FileManager.default.fileExists(atPath: u.path) else { return nil }
+            return (k, u)
+        }
+        guard !tracks.isEmpty else { return }
+        do { try player.loadStems(tracks) } catch { show("Couldn't open stems", error.localizedDescription) }
+    }
+
     // MARK: Export
 
-    func exportWAV(songID: String, useSelection: Bool, applyProcessing: Bool, bitDepth: Int) {
+    enum ExportAudio {
+        case original
+        /// Stems mixed into one file with the given gains.
+        case stemMix([StemKind: Float])
+        /// One file per stem.
+        case separateStems([StemKind])
+    }
+
+    func exportWAV(songID: String, useSelection: Bool, applyProcessing: Bool, bitDepth: Int, audio: ExportAudio = .original) {
         guard let song = songs.first(where: { $0.id == songID }), activity == nil else { return }
         var start = 0.0
         var end = player.duration > 0 ? player.duration : song.duration
@@ -329,22 +434,67 @@ final class AppModel {
         if isSection, let a = player.loopStart, let b = player.loopEnd, b > a { start = a; end = b }
         let rate: Float = applyProcessing ? player.rate : 1
         let pitch = applyProcessing ? player.pitchSemitones : 0
-
-        let panel = NSSavePanel()
-        panel.title = "Export WAV"
-        panel.allowedContentTypes = [.wav]
-        panel.canCreateDirectories = true
-        panel.nameFieldStringValue = AudioExporter.suggestedFileName(
-            title: song.displayTitle, rate: rate, pitch: pitch, isSection: isSection)
-        guard panel.runModal() == .OK, let destination = panel.url else { return }
-
         let options = AudioExporter.Options(start: start, end: end, rate: rate, pitchSemitones: pitch, bitDepth: bitDepth)
-        let source = song.audioURL
-        activity = Activity(title: "Exporting WAV", detail: destination.lastPathComponent, progress: 0)
+        let baseName = AudioExporter.suggestedFileName(title: song.displayTitle, rate: rate, pitch: pitch, isSection: isSection)
+            .replacingOccurrences(of: ".wav", with: "")
+
+        // Build the list of output files: (destination, [(source, gain)])
+        var jobs: [(URL, [(URL, Float)])] = []
+        var revealURL: URL?
+        switch audio {
+        case .original:
+            let panel = NSSavePanel()
+            panel.title = "Export WAV"
+            panel.allowedContentTypes = [.wav]
+            panel.canCreateDirectories = true
+            panel.nameFieldStringValue = baseName + ".wav"
+            guard panel.runModal() == .OK, let dest = panel.url else { return }
+            jobs = [(dest, [(song.audioURL, 1)])]
+            revealURL = dest
+
+        case .stemMix(let gains):
+            guard let set = song.stems else { return }
+            let srcs: [(URL, Float)] = gains.compactMap { k, g in
+                guard g > 0, let u = set.url(k, songID: song.id) else { return nil }
+                return (u, g)
+            }
+            guard !srcs.isEmpty else { show("Nothing to export", "All selected stems are muted."); return }
+            let label = gains.filter { $0.value > 0 }.keys.sorted { $0.rawValue < $1.rawValue }.map(\.label).joined(separator: "+")
+            let panel = NSSavePanel()
+            panel.title = "Export Stem Mix"
+            panel.allowedContentTypes = [.wav]
+            panel.canCreateDirectories = true
+            panel.nameFieldStringValue = "\(baseName) [\(label)].wav"
+            guard panel.runModal() == .OK, let dest = panel.url else { return }
+            jobs = [(dest, srcs)]
+            revealURL = dest
+
+        case .separateStems(let kinds):
+            guard let set = song.stems, !kinds.isEmpty else { return }
+            let panel = NSOpenPanel()
+            panel.title = "Choose a folder for the stems"
+            panel.prompt = "Export Here"
+            panel.canChooseDirectories = true
+            panel.canChooseFiles = false
+            panel.canCreateDirectories = true
+            guard panel.runModal() == .OK, let folder = panel.url else { return }
+            for k in kinds {
+                guard let u = set.url(k, songID: song.id) else { continue }
+                jobs.append((folder.appendingPathComponent("\(baseName) - \(k.label).wav"), [(u, 1)]))
+            }
+            revealURL = jobs.first?.0
+        }
+        guard !jobs.isEmpty else { return }
+
+        activity = Activity(title: "Exporting WAV", detail: jobs.count == 1 ? jobs[0].0.lastPathComponent : "\(jobs.count) files", progress: 0)
+        let jobList = jobs
         let work = Task.detached(priority: .userInitiated) {
-            try AudioExporter.exportWAV(source: source, destination: destination, options: options) { p in
-                Task { @MainActor in
-                    if self.activity?.title == "Exporting WAV" { self.activity?.progress = p }
+            for (i, job) in jobList.enumerated() {
+                try AudioExporter.exportWAV(sources: job.1, destination: job.0, options: options) { p in
+                    let overall = (Double(i) + p) / Double(jobList.count)
+                    Task { @MainActor in
+                        if self.activity?.title == "Exporting WAV" { self.activity?.progress = overall }
+                    }
                 }
             }
         }
@@ -353,10 +503,10 @@ final class AppModel {
             do {
                 try await work.value
                 activity = nil
-                NSWorkspace.shared.activateFileViewerSelecting([destination])
+                if let revealURL { NSWorkspace.shared.activateFileViewerSelecting(jobList.map(\.0).isEmpty ? [revealURL] : jobList.map(\.0)) }
             } catch is CancellationError {
                 activity = nil
-                try? FileManager.default.removeItem(at: destination)
+                for j in jobList { try? FileManager.default.removeItem(at: j.0) }
             } catch {
                 activity = nil
                 show("Export failed", error.localizedDescription)
@@ -371,6 +521,7 @@ final class AppModel {
         guard let song = songs.first(where: { $0.id == id }) else { return }
         if selectedID == id { select(nil) }
         try? FileManager.default.removeItem(at: song.audioURL)
+        try? FileManager.default.removeItem(at: LibraryPaths.stems(id))
         songs.removeAll { $0.id == id }
         save()
     }

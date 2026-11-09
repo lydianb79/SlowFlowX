@@ -102,6 +102,36 @@ kernel void melody_salience(device const float* mags  [[buffer(0)]],   // [frame
     out[f * p.candidates + c] = max(s, 0.0);
 }
 
+// ───────────────────────────── Compute: median filter (stem separation) ─────────────────────────────
+// Median of a (2r+1)-long neighbourhood along time (axis 0) or frequency (axis 1) of a magnitude
+// spectrogram. Time-medians keep sustained (harmonic) sounds, frequency-medians keep broadband hits.
+kernel void median_filter(device const float* input  [[buffer(0)]],   // [frames * bins]
+                          device float*       output [[buffer(1)]],
+                          constant uint4&     p      [[buffer(2)]],   // x = frames, y = bins, z = axis, w = radius
+                          uint2 gid [[thread_position_in_grid]])
+{
+    uint f = gid.x;
+    uint b = gid.y;
+    if (f >= p.x || b >= p.y) return;
+    int r = int(min(p.w, 16u));
+    int n = 2 * r + 1;
+    float v[33];
+    for (int k = -r; k <= r; ++k) {
+        int ff = int(f);
+        int bb = int(b);
+        if (p.z == 0) ff = clamp(int(f) + k, 0, int(p.x) - 1);
+        else          bb = clamp(int(b) + k, 0, int(p.y) - 1);
+        v[k + r] = input[uint(ff) * p.y + uint(bb)];
+    }
+    for (int i = 1; i < n; ++i) {
+        float key = v[i];
+        int j = i - 1;
+        while (j >= 0 && v[j] > key) { v[j + 1] = v[j]; j--; }
+        v[j + 1] = key;
+    }
+    output[f * p.y + b] = v[r];
+}
+
 // ───────────────────────────── Render: shared full-screen triangle ─────────────────────────────
 struct VOut {
     float4 position [[position]];

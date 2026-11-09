@@ -219,6 +219,25 @@ private struct RhythmToolbar: View {
             }
             .buttonStyle(GhostButtonStyle())
 
+            if let stem = track.stemUsed.flatMap(StemKind.init(rawValue:)) {
+                Badge(text: "from \(stem.label.lowercased()) stem", tint: stem.color)
+            } else if song.stems?.bestStem(for: track.source) != nil {
+                Button {
+                    model.analyzeMelody(song.id, source: track.source)
+                } label: {
+                    Label("Transcribe from Stem", systemImage: "wand.and.stars")
+                }
+                .buttonStyle(GhostButtonStyle(active: true))
+                .help("Stems are available: transcribing from the isolated part is much more accurate")
+            } else if song.stems == nil && !track.source.isRhythm {
+                Button {
+                    model.separateStems(song.id, engine: model.tools.demucs != nil ? .demucs : .builtin)
+                } label: {
+                    Label("Separate Stems for Accuracy", systemImage: "slider.vertical.3")
+                }
+                .buttonStyle(GhostButtonStyle())
+                .help("Isolating the part first gives much better transcriptions")
+            }
             if track.beatOffset == nil {
                 Button {
                     model.analyzeMelody(song.id, source: track.source)
