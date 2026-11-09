@@ -39,6 +39,8 @@ final class AppModel {
     /// High-resolution waveform peaks (100 per second) for the zoomable waveform, computed on demand.
     var detailPeaks: [String: [Float]] = [:]
     var showExportSheet = false
+    /// Progress of melody transcriptions, keyed by "songID|source".
+    var melodyStatus: [String: AnalysisStatus] = [:]
 
     @ObservationIgnored let player = PlaybackEngine()
     @ObservationIgnored private let downloader = YouTubeDownloader()
@@ -209,6 +211,111 @@ final class AppModel {
                 show("Transcription failed", error.localizedDescription)
             }
             lyricsLoading.remove(id)
+        }
+    }
+
+    // MARK: Melody / riff transcription
+
+    static func melodyKey(_ id: String, _ source: MelodySource) -> String { id + "|" + source.rawValue }
+
+    func analyzeMelody(_ id: String, source: MelodySource) {
+        let key = Self.melodyKey(id, source)
+        guard let song = songs.first(where: { $0.id == id }), melodyStatus[key] == nil else { return }
+        melodyStatus[key] = AnalysisStatus(stage: "Preparing", progress: 0)
+        let url = song.audioURL
+        Task {
+            do {
+                let track = try await Task.detached(priority: .userInitiated) {
+                    try MelodyAnalyzer().analyze(url: url, source: source) { stage, p in
+                        Task { @MainActor in
+                            if self.melodyStatus[key] != nil {
+                                self.melodyStatus[key] = AnalysisStatus(stage: stage, progress: p)
+                            }
+                        }
+                    }
+                }.value
+                update(id) { song in
+                    var m = song.melodies ?? [:]
+                    m[source.rawValue] = track
+                    song.melodies = m
+                }
+            } catch {
+                show("Transcription failed", error.localizedDescription)
+            }
+            melodyStatus[key] = nil
+        }
+    }
+
+    func exportMIDI(_ id: String, source: MelodySource) {
+        guard let song = songs.first(where: { $0.id == id }), let track = song.melodies?[source.rawValue] else { return }
+        let panel = NSSavePanel()
+        panel.title = "Export MIDI"
+        panel.allowedContentTypes = [UTType(filenameExtension: "mid") ?? .data]
+        panel.nameFieldStringValue = "\(song.displayTitle) - \(source.shortLabel).mid"
+            .replacingOccurrences(of: "/", with: "-").replacingOccurrences(of: ":", with: "-")
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        let data = MelodyExport.midiFile(track: track, chords: song.analysis?.chords ?? [], title: song.displayTitle,
+                                         fallbackBPM: song.analysis?.bpm ?? 0, transpose: player.pitchSemitones,
+                                         resolution: Self.quantizeResolution)
+        do {
+            try data.write(to: url, options: .atomic)
+            NSWorkspace.shared.activateFileViewerSelecting([url])
+        } catch {
+            show("Export failed", error.localizedDescription)
+        }
+    }
+
+    func asciiTab(_ id: String, source: MelodySource) -> String? {
+        guard let song = songs.first(where: { $0.id == id }), let track = song.melodies?[source.rawValue] else { return nil }
+        return MelodyExport.asciiTab(track: track, chords: song.analysis?.chords ?? [],
+                                     title: "\(song.displayTitle) – \(song.displayArtist)",
+                                     fallbackBPM: song.analysis?.bpm ?? 0, transpose: player.pitchSemitones,
+                                     resolution: Self.quantizeResolution)
+    }
+
+    /// Grid snapping chosen in the Tab & Notes panel: 0 = off, 1 = 16ths, 2 = 8ths.
+    static var quantizeResolution: Int { UserDefaults.standard.integer(forKey: "melodyQuantize") }
+
+    /// Adjust the detected tempo of a part (e.g. halve or double when the guess is off).
+    func setMelodyTempo(_ id: String, source: MelodySource, bpm: Double) {
+        let clamped = min(max(bpm, 40), 240)
+        update(id) { song in
+            guard var t = song.melodies?[source.rawValue] else { return }
+            t.bpm = clamped
+            song.melodies?[source.rawValue] = t
+        }
+    }
+
+    /// Move the beat grid so the beat falls at `time`.
+    func alignBeat(_ id: String, source: MelodySource, at time: Double) {
+        update(id) { song in
+            guard var t = song.melodies?[source.rawValue] else { return }
+            let grid = t.grid(fallbackBPM: song.analysis?.bpm ?? 0)
+            var off = time.truncatingRemainder(dividingBy: grid.beat)
+            if off < 0 { off += grid.beat }
+            t.beatOffset = off
+            song.melodies?[source.rawValue] = t
+        }
+    }
+
+    func copyASCIITab(_ id: String, source: MelodySource) {
+        guard let text = asciiTab(id, source: source) else { return }
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(text, forType: .string)
+    }
+
+    func saveASCIITab(_ id: String, source: MelodySource) {
+        guard let song = songs.first(where: { $0.id == id }), let text = asciiTab(id, source: source) else { return }
+        let panel = NSSavePanel()
+        panel.title = "Save Tab"
+        panel.allowedContentTypes = [.plainText]
+        panel.nameFieldStringValue = "\(song.displayTitle) - \(source.shortLabel) tab.txt"
+            .replacingOccurrences(of: "/", with: "-").replacingOccurrences(of: ":", with: "-")
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        do {
+            try text.write(to: url, atomically: true, encoding: .utf8)
+        } catch {
+            show("Save failed", error.localizedDescription)
         }
     }
 

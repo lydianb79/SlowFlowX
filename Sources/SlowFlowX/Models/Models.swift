@@ -147,6 +147,8 @@ struct Song: Identifiable, Codable, Hashable {
     var addedAt: Date
     var analysis: SongAnalysis?
     var lyrics: Lyrics?
+    /// Transcribed melody tracks keyed by `MelodySource.rawValue`.
+    var melodies: [String: MelodyTrack]? = nil
 
     var audioURL: URL { LibraryPaths.audio.appendingPathComponent(audioFileName) }
     var displayArtist: String { artist ?? uploader ?? "Unknown artist" }

@@ -16,6 +16,7 @@ struct SlowFlowXApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
     @State private var model = AppModel()
     @State private var themes = ThemeStore()
+    @AppStorage("lowerPane") private var lowerPane = LowerPane.chordsLyrics.rawValue
 
     var body: some Scene {
         WindowGroup("SlowFlowX") {
@@ -34,6 +35,13 @@ struct SlowFlowXApp: App {
                 Button("Export WAV…") { model.showExportSheet = true }
                     .keyboardShortcut("e", modifiers: .command)
                     .disabled(model.selectedSong == nil || model.activity != nil)
+            }
+            CommandGroup(after: .toolbar) {
+                Button("Chords & Lyrics") { lowerPane = LowerPane.chordsLyrics.rawValue }
+                    .keyboardShortcut("1", modifiers: .command)
+                Button("Tab & Notes") { lowerPane = LowerPane.melody.rawValue }
+                    .keyboardShortcut("2", modifiers: .command)
+                Divider()
             }
             CommandMenu("Playback") {
                 Button("Play / Pause") { model.player.togglePlayPause() }

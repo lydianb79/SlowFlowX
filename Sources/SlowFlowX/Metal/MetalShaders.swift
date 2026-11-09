@@ -53,6 +53,55 @@ kernel void score_chords(device const float* chroma    [[buffer(0)]],
     scores[f * dims.y + t] = norm > 1e-9 ? dotv / sqrt(norm) : 0.0;
 }
 
+// ───────────────────────────── Compute: melody pitch salience ─────────────────────────────
+// Harmonic summation over log-magnitude spectra: for every frame and candidate f0, add the
+// (interpolated) magnitude at each harmonic, weighted by alpha^(h-1), and subtract energy found
+// half-way between harmonics to suppress octave-below errors.
+struct SalienceParams {
+    uint  frames;
+    uint  bins;
+    uint  candidates;
+    uint  harmonics;
+    float binHz;
+    float alpha;
+    float maxFreq;
+    float pad;
+};
+
+kernel void melody_salience(device const float* mags  [[buffer(0)]],   // [frames * bins]
+                            device const float* cand  [[buffer(1)]],   // [candidates] f0 in Hz
+                            device float*       out   [[buffer(2)]],   // [frames * candidates]
+                            constant SalienceParams& p [[buffer(3)]],
+                            uint2 gid [[thread_position_in_grid]])
+{
+    uint f = gid.x;
+    uint c = gid.y;
+    if (f >= p.frames || c >= p.candidates) return;
+    device const float* row = mags + f * p.bins;
+    float f0 = cand[c];
+    float s = 0.0;
+    float w = 1.0;
+    for (uint h = 1; h <= p.harmonics; ++h) {
+        float fh = f0 * float(h);
+        if (fh >= p.maxFreq) break;
+        float b = fh / p.binHz;
+        uint b0 = uint(b);
+        if (b0 + 1 >= p.bins) break;
+        float fr = b - float(b0);
+        float m = mix(row[b0], row[b0 + 1], fr);
+        m = max(m, max(row[b0], row[b0 + 1]) * 0.9);
+        float between = 0.0;
+        if (h > 1) {
+            float bh = (fh - 0.5 * f0) / p.binHz;
+            uint bh0 = uint(bh);
+            if (bh0 + 1 < p.bins) between = mix(row[bh0], row[bh0 + 1], bh - float(bh0));
+        }
+        s += w * (m - 0.5 * between);
+        w *= p.alpha;
+    }
+    out[f * p.candidates + c] = max(s, 0.0);
+}
+
 // ───────────────────────────── Render: shared full-screen triangle ─────────────────────────────
 struct VOut {
     float4 position [[position]];

@@ -11,6 +11,7 @@ final class MetalContext {
     let spectrumPipeline: MTLRenderPipelineState
     let foldPipeline: MTLComputePipelineState
     let scorePipeline: MTLComputePipelineState
+    let saliencePipeline: MTLComputePipelineState
 
     static let pixelFormat: MTLPixelFormat = .bgra8Unorm
 
@@ -24,7 +25,8 @@ final class MetalContext {
                   let waveFn = library.makeFunction(name: "waveform_fragment"),
                   let specFn = library.makeFunction(name: "spectrum_fragment"),
                   let foldFn = library.makeFunction(name: "fold_chroma"),
-                  let scoreFn = library.makeFunction(name: "score_chords") else { return nil }
+                  let scoreFn = library.makeFunction(name: "score_chords"),
+                  let salienceFn = library.makeFunction(name: "melody_salience") else { return nil }
 
             func renderPipeline(_ fragment: MTLFunction) throws -> MTLRenderPipelineState {
                 let desc = MTLRenderPipelineDescriptor()
@@ -37,6 +39,7 @@ final class MetalContext {
             spectrumPipeline = try renderPipeline(specFn)
             foldPipeline = try device.makeComputePipelineState(function: foldFn)
             scorePipeline = try device.makeComputePipelineState(function: scoreFn)
+            saliencePipeline = try device.makeComputePipelineState(function: salienceFn)
         } catch {
             NSLog("SlowFlowX: Metal setup failed: \(error)")
             return nil
@@ -101,5 +104,45 @@ enum MetalCompute {
 
         let ptr = outBuf.contents().bindMemory(to: Float.self, capacity: frames * templateCount)
         return Array(UnsafeBufferPointer(start: ptr, count: frames * templateCount))
+    }
+
+    private struct SalienceParams {
+        var frames: UInt32
+        var bins: UInt32
+        var candidates: UInt32
+        var harmonics: UInt32
+        var binHz: Float
+        var alpha: Float
+        var maxFreq: Float
+        var pad: Float = 0
+    }
+
+    static func melodySalience(mags: [Float], frames: Int, bins: Int, candidates: [Float],
+                               harmonics: Int, binHz: Float, maxFreq: Float) -> [Float]? {
+        guard let ctx = MetalContext.shared, frames > 0, bins > 1, !candidates.isEmpty else { return nil }
+        let d = ctx.device
+        let C = candidates.count
+        guard let mBuf = d.makeBuffer(bytes: mags, length: mags.count * 4, options: .storageModeShared),
+              let cBuf = d.makeBuffer(bytes: candidates, length: C * 4, options: .storageModeShared),
+              let outBuf = d.makeBuffer(length: frames * C * 4, options: .storageModeShared),
+              let cmd = ctx.queue.makeCommandBuffer(),
+              let enc = cmd.makeComputeCommandEncoder() else { return nil }
+
+        var params = SalienceParams(frames: UInt32(frames), bins: UInt32(bins), candidates: UInt32(C),
+                                    harmonics: UInt32(harmonics), binHz: binHz, alpha: 0.8, maxFreq: maxFreq)
+        enc.setComputePipelineState(ctx.saliencePipeline)
+        enc.setBuffer(mBuf, offset: 0, index: 0)
+        enc.setBuffer(cBuf, offset: 0, index: 1)
+        enc.setBuffer(outBuf, offset: 0, index: 2)
+        enc.setBytes(&params, length: MemoryLayout<SalienceParams>.stride, index: 3)
+        let tg = MTLSize(width: 32, height: 4, depth: 1)
+        let groups = MTLSize(width: (frames + 31) / 32, height: (C + 3) / 4, depth: 1)
+        enc.dispatchThreadgroups(groups, threadsPerThreadgroup: tg)
+        enc.endEncoding()
+        cmd.commit()
+        cmd.waitUntilCompleted()
+        guard cmd.status == .completed else { return nil }
+        let ptr = outBuf.contents().bindMemory(to: Float.self, capacity: frames * C)
+        return Array(UnsafeBufferPointer(start: ptr, count: frames * C))
     }
 }

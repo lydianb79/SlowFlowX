@@ -1,8 +1,16 @@
 import SwiftUI
 
+enum LowerPane: String, CaseIterable, Identifiable {
+    case chordsLyrics, melody
+    var id: String { rawValue }
+    var label: String { self == .chordsLyrics ? "Chords & Lyrics" : "Tab & Notes" }
+    var icon: String { self == .chordsLyrics ? "text.quote" : "music.note.list" }
+}
+
 struct SongWorkspace: View {
     @Environment(AppModel.self) private var model
     @Environment(\.appTheme) private var theme
+    @AppStorage("lowerPane") private var paneRaw = LowerPane.chordsLyrics.rawValue
     let song: Song
 
     var body: some View {
@@ -10,13 +18,18 @@ struct SongWorkspace: View {
             VStack(spacing: 14) {
                 SongHeader(song: song)
                 WaveformPanel(song: song)
-                HStack(alignment: .top, spacing: 14) {
-                    ChordsPanel(song: song)
-                        .frame(minWidth: 380, maxWidth: .infinity)
-                    LyricsPanel(song: song)
-                        .frame(minWidth: 340, maxWidth: .infinity)
+                if paneRaw == LowerPane.melody.rawValue {
+                    MelodyPanel(song: song)
+                        .frame(minHeight: 0, maxHeight: .infinity)
+                } else {
+                    HStack(alignment: .top, spacing: 14) {
+                        ChordsPanel(song: song)
+                            .frame(minWidth: 380, maxWidth: .infinity)
+                        LyricsPanel(song: song)
+                            .frame(minWidth: 340, maxWidth: .infinity)
+                    }
+                    .frame(minHeight: 0, maxHeight: .infinity)
                 }
-                .frame(minHeight: 0, maxHeight: .infinity)
             }
             .padding(.horizontal, 24)
             .padding(.bottom, 14)
@@ -39,6 +52,7 @@ struct SongWorkspace: View {
 private struct SongHeader: View {
     @Environment(AppModel.self) private var model
     @Environment(\.appTheme) private var theme
+    @AppStorage("lowerPane") private var paneRaw = LowerPane.chordsLyrics.rawValue
     let song: Song
 
     var body: some View {
@@ -82,6 +96,16 @@ private struct SongHeader: View {
                         .frame(width: 180)
                 }
             }
+
+            Picker("View", selection: $paneRaw) {
+                ForEach(LowerPane.allCases) { p in
+                    Label(p.label, systemImage: p.icon).tag(p.rawValue)
+                }
+            }
+            .pickerStyle(.segmented)
+            .labelsHidden()
+            .fixedSize()
+            .help("Switch between chords & lyrics and the melody tab / piano roll")
 
             Menu {
                 Button("Re-analyze Chords") { model.analyze(song.id) }

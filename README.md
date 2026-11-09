@@ -34,6 +34,27 @@ SlowFlowX downloads the audio of a song and detects its chords on the GPU with *
 - **Chords in this song**: a strip showing every chord the song uses, with its shape.
 - A **chord grid** you can click to jump to a chord. Right-click a chord to loop it.
 
+### Tab & notes (riffs and melodies)
+- **Melody transcription**: pick the **vocal melody**, a **lead guitar riff**, the **rhythm guitar** or the **bass line**, and SlowFlowX transcribes it.
+  - The **`melody_salience` Metal compute kernel** scores how strong every possible pitch is in each 12 ms frame. It sums the harmonics and suppresses octave errors.
+  - A **Viterbi pitch tracker** detects where the part is playing and keeps glides and vibrato smooth.
+  - Semitone **note segmentation** turns the pitch line into separate notes.
+  - **Accurate note lengths**: an attack detector splits repeated notes (e.g. chugging riffs) into separate hits and snaps each note to its attack. For guitar and bass, notes end when the pitch dies away rather than when it disappears completely.
+  - **Tempo and beat position** are found for every part, so bar lines and the 16th grid line up with the music.
+- **Rhythm guitar**: strums are detected from attacks and labelled **↓ down / ↑ up**. Down falls on the beat, up between beats. If a fair share of strums land on in-between 16ths, the pattern is treated as 16th-note strumming. Each strum shows the chord shape from the chord analysis, in the tab and in the piano roll.
+- **Rhythm notation** under the tab: stems, flags, dots, and beams grouped per beat.
+- **Grid snapping**: show notes as played (Off), or snapped to 1/8 or 1/16 notes. Exports use the same setting.
+- **Tempo controls**: ½× / 2× / ±1 BPM when the tempo guess is off. **Beat Here** moves the grid so a beat falls at the playhead.
+- **Guitar / bass tab** that scrolls with the music:
+  - Frets are chosen by an optimiser that keeps hand movement small (standard EADGBE tuning, or EADG for bass).
+  - Notes outside the instrument's range are moved by an octave and marked 8va/8vb.
+  - Chord names and beat and bar lines are shown above the tab.
+- **Piano roll** with a keyboard whose keys light up as each note plays, plus note names on the bars.
+- A **current / next notes** display, with the current lyric line underneath.
+- Drag to scrub and click to jump. Speed, looping and transpose all apply (transposing re-fingers the tab).
+- **Export MIDI** (open it in GarageBand, Logic or MuseScore to see sheet music; the first beat is aligned to the bar), or **copy / save a plain-text tab** with a rhythm line and down/up strum markers.
+- Transcription is automatic and approximate. It works best when the part stands out in the mix.
+
 ### Lyrics
 - **Synced lyrics** from [LRCLIB](https://lrclib.net), with the chords shown above each line. The current line is highlighted and auto-scrolls; click a line to jump to it.
 - **Manual search** by artist and title, for when the automatic match misses.
@@ -95,6 +116,7 @@ The Metal shaders are compiled at runtime from `MetalShaders.swift`. You don't n
 | Transpose down / up | ⌥⌘↓ / ⌥⌘↑ |
 | Loop start / end / clear | ⇧⌘A / ⇧⌘B / ⇧⌘L |
 | Export WAV | ⌘E |
+| Chords & Lyrics / Tab & Notes view | ⌘1 / ⌘2 |
 | Move through the waveform | scroll or swipe |
 | Zoom the waveform | ⌘-scroll or pinch |
 | Select a section to practise | drag on the waveform |
@@ -107,13 +129,16 @@ Sources/SlowFlowX/
   App/        SlowFlowXApp (scene, menus, key monitor), AppModel (state & workflows)
   Audio/      PlaybackEngine (AVAudioEngine + TimePitch), SpectrumTap (live FFT),
               AudioExporter (offline WAV render)
-  Analysis/   AudioLoader (decode/resample), ChordAnalyzer (STFT → chroma → Viterbi, key, tempo)
+  Analysis/   AudioLoader (decode/resample), ChordAnalyzer (STFT → chroma → Viterbi, key, tempo),
+              MelodyAnalyzer (harmonic salience → pitch tracking → notes, strums),
+              OnsetDetector (attacks, beat position)
+  Models/     Song/chord/lyrics models, Melody (notes, tab fingering, MIDI & text-tab export)
   Metal/      MetalShaders (MSL source), MetalContext (pipelines + GPU compute),
               MetalViews (waveform & spectrum renderers, mouse/trackpad handling)
   Services/   YouTubeDownloader (yt-dlp), LyricsService (LRCLIB + Speech), ProcessRunner
   Theme/      Theme definitions + ThemeStore
   Views/      Sidebar, import bar, workspace & waveform, chords panel, chord diagrams,
-              lyrics, transport, export sheet, settings
+              lyrics, melody tab & piano roll, transport, export sheet, settings
 Resources/    Info.plist, AppIcon.icns, AppIcon.iconset, AppIcon-1024.png
 Scripts/      build_app.sh
 ```
@@ -125,6 +150,8 @@ Your library (audio and analysis) is stored in `~/Library/Application Support/Sl
 - **Downloads fail**: YouTube has probably changed something. Run `brew upgrade yt-dlp`.
 - **"yt-dlp was not found"**: install it with Homebrew, then click *Re-check* on the start screen or in Settings › Tools.
 - **No lyrics found**: use the 🔍 button in the Lyrics panel to search by exact artist and title, or transcribe from the audio.
+- **Bars or note lengths look shifted**: use ½× / 2× if the tempo is off. Then pause on a clear downbeat and press **Beat Here**. Parts transcribed with an older version show an **Update Transcription** button.
+- **Messy tab / notes**: try another part (Vocal, Lead or Bass). Transcription follows whichever part is loudest in its range, so busy mixes produce stray notes. Slowing down doesn't affect the transcription, but it makes checking by ear much easier.
 - **Wrong chords**: automatic recognition is an estimate. It is very good for practice charts, but dense mixes, heavy distortion or jazz voicings will cause errors. Use the chord grid together with your ears.
 
 ## Credits
