@@ -320,58 +320,45 @@ final class ChordAnalyzer {
     // MARK: - Tempo
 
     static func estimateTempo(_ x: [Float], sampleRate: Double) -> Double {
-        let hop = 512, win = 1024
-        let frames = (x.count - win) / hop
-        guard frames > 400 else { return 0 }
-        var env = [Float](repeating: 0, count: frames)
-        x.withUnsafeBufferPointer { p in
-            guard let base = p.baseAddress else { return }
-            for f in 0..<frames {
-                var ms: Float = 0
-                vDSP_measqv(base + f * hop, 1, &ms, vDSP_Length(win))
-                env[f] = log(1e-7 + ms)
-            }
-        }
-        var onset = [Float](repeating: 0, count: frames)
-        for i in 1..<frames { onset[i] = max(0, env[i] - env[i - 1]) }
-        // subtract local mean to emphasise peaks
-        let r = 8
-        var detr = [Float](repeating: 0, count: frames)
-        for i in 0..<frames {
-            let lo = max(0, i - r), hi = min(frames - 1, i + r)
-            var s: Float = 0
-            for k in lo...hi { s += onset[k] }
-            detr[i] = max(0, onset[i] - s / Float(hi - lo + 1))
-        }
+        let det = OnsetDetector.detect(x, sampleRate: sampleRate, lowHz: 40, highHz: 8000)
+        return tempo(fromFlux: det.flux, frameRate: det.frameRate)
+    }
 
-        let fps = sampleRate / Double(hop)
-        let minLag = max(1, Int(fps * 60 / 200)), maxLag = Int(fps * 60 / 55)
-        guard maxLag + 2 < frames else { return 0 }
-        var ac = [Float](repeating: 0, count: maxLag + 2)
-        detr.withUnsafeBufferPointer { p in
+    /// Tempo from a spectral-flux onset envelope: autocorrelation scored over several metrical
+    /// levels (beat, 2 beats, half beat, bar) so the estimate locks to the beat rather than
+    /// the 8th-note or half-time pulse, with a mild prior around 120 BPM.
+    static func tempo(fromFlux flux: [Float], frameRate fps: Double) -> Double {
+        let n = flux.count
+        guard n > 600 else { return 0 }
+        let mean = flux.reduce(0, +) / Float(n)
+        let f = flux.map { max(0, $0 - mean) }
+        let maxLag = min(n - 1, Int(fps * 60 / 40 * 4) + 2)   // up to 4 beats at 40 BPM
+        var ac = [Float](repeating: 0, count: maxLag + 1)
+        f.withUnsafeBufferPointer { p in
             guard let base = p.baseAddress else { return }
-            for lag in minLag...(maxLag + 1) {
+            for lag in 1...maxLag {
                 var s: Float = 0
-                vDSP_dotpr(base, 1, base + lag, 1, &s, vDSP_Length(frames - lag))
-                ac[lag] = s
+                vDSP_dotpr(base, 1, base + lag, 1, &s, vDSP_Length(n - lag))
+                ac[lag] = s / Float(n - lag)
             }
         }
-        var bestLag = minLag
-        var bestScore = -Float.greatestFiniteMagnitude
-        for lag in minLag...maxLag {
-            let bpm = 60 * fps / Double(lag)
-            let w = Float(exp(-0.5 * pow(log2(bpm / 115) / 0.9, 2)))
-            let score = ac[lag] * w
-            if score > bestScore { bestScore = score; bestLag = lag }
+        func acAt(_ lag: Double) -> Float {
+            guard lag >= 1, lag < Double(maxLag) else { return 0 }
+            let i = Int(lag), fr = Float(lag - Double(i))
+            return ac[i] * (1 - fr) + ac[i + 1] * fr
         }
-        // parabolic interpolation for sub-frame precision
-        var lag = Double(bestLag)
-        if bestLag > minLag {
-            let a = Double(ac[bestLag - 1]), b = Double(ac[bestLag]), c = Double(ac[bestLag + 1])
-            let denom = a - 2 * b + c
-            if abs(denom) > 1e-9 { lag += 0.5 * (a - c) / denom }
+        var best = 0.0, bestScore: Float = -.greatestFiniteMagnitude
+        var bpm = 60.0
+        while bpm <= 200 {
+            let lag = fps * 60 / bpm
+            // balanced over metrical levels so neither half- nor double-time is favoured by default
+            let score = acAt(lag) + 0.5 * acAt(2 * lag) + 0.25 * acAt(4 * lag) + 0.25 * acAt(lag / 2)
+            let prior = Float(exp(-0.5 * pow(log2(bpm / 120) / 0.7, 2)))
+            let v = score * prior
+            if v > bestScore { bestScore = v; best = bpm }
+            bpm += 0.5
         }
-        return (60 * fps / lag).rounded()
+        return best
     }
 
     // MARK: - Helpers

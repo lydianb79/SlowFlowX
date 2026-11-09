@@ -30,7 +30,85 @@ enum StemSeparator {
 
     /// Python 3.12 + torch/torchaudio 2.8: newer Pythons lack wheels for some dependencies, and
     /// torchaudio ≥ 2.9 routes saving through TorchCodec, which breaks Demucs' WAV output.
-    static let installCommand = #"brew install uv && uv tool install --python 3.12 demucs --with "torch==2.8.*" --with "torchaudio==2.8.*""#
+    /// numpy and soundfile are listed explicitly: Demucs imports numpy without declaring it (torch 2.8 no
+    /// longer pulls it in), and torchaudio 2.8 needs soundfile as a reliable WAV backend.
+    static let installCommand = #"brew install uv && uv tool install --force --python 3.12 demucs --with "torch==2.8.*" --with "torchaudio==2.8.*" --with numpy --with soundfile"#
+
+    // MARK: - Installing Demucs
+
+    enum InstallError: LocalizedError {
+        case homebrewMissing
+        case failed(String)
+        var errorDescription: String? {
+            switch self {
+            case .homebrewMissing:
+                return "Homebrew was not found. Install it from https://brew.sh, then try again."
+            case .failed(let step):
+                return "Installation failed during: \(step). See the log for details."
+            }
+        }
+    }
+
+    /// Installs Demucs the reliable way: Homebrew → uv → Demucs on Python 3.12 with torch/torchaudio 2.8.
+    /// `log` receives every output line.
+    static func installDemucs(log: @escaping @Sendable (String) -> Void) async throws {
+        let env = ToolLocator.environment
+        var uv = ToolLocator.find("uv")
+        if uv == nil {
+            guard let brew = ToolLocator.find("brew") else { throw InstallError.homebrewMissing }
+            log("$ brew install uv")
+            let r = try await ProcessRunner.run(brew, ["install", "uv"], environment: env,
+                                                onStdoutLine: log, onStderrLine: log)
+            guard r.status == 0 else { throw InstallError.failed("brew install uv") }
+            uv = ToolLocator.find("uv")
+        }
+        guard let uv else { throw InstallError.failed("locating uv") }
+
+        let args = ["tool", "install", "--force", "--python", "3.12", "demucs",
+                    "--with", "torch==2.8.*", "--with", "torchaudio==2.8.*",
+                    "--with", "numpy", "--with", "soundfile"]
+        log("$ uv " + args.joined(separator: " "))
+        let r = try await ProcessRunner.run(uv, args, environment: env, onStdoutLine: log, onStderrLine: log)
+        guard r.status == 0 else { throw InstallError.failed("uv tool install demucs") }
+
+        guard let demucs = ToolLocator.find("demucs") else { throw InstallError.failed("locating demucs") }
+        log("$ self-test: import numpy, soundfile, torch, torchaudio, demucs")
+        let check = await checkDemucs()
+        guard check.ok else {
+            log(check.message)
+            throw InstallError.failed("demucs self-test")
+        }
+        log("✓ Demucs is installed and working: \(demucs.path)")
+    }
+
+    /// Verifies that Demucs can actually run — not just that its launcher exists — by importing
+    /// everything a separation needs with Demucs' own Python interpreter.
+    static func checkDemucs() async -> (ok: Bool, message: String) {
+        guard let demucs = demucsURL else { return (false, "Demucs is not installed.") }
+        var exe = demucs
+        var args = ["--help"]
+        if let handle = try? FileHandle(forReadingFrom: demucs) {
+            let head = (try? handle.read(upToCount: 512)) ?? Data()
+            try? handle.close()
+            if let text = String(data: head, encoding: .utf8), text.hasPrefix("#!"),
+               let line = text.dropFirst(2).split(separator: "\n").first {
+                let interpreter = line.trimmingCharacters(in: .whitespaces)
+                if !interpreter.contains(" "), FileManager.default.isExecutableFile(atPath: interpreter) {
+                    exe = URL(fileURLWithPath: interpreter)
+                    args = ["-c", "import numpy, soundfile, torch, torchaudio, demucs.separate"]
+                }
+            }
+        }
+        do {
+            let r = try await ProcessRunner.run(exe, args, environment: ToolLocator.environment)
+            if r.status == 0 { return (true, "") }
+            let lines = r.stderr.split(separator: "\n").map(String.init)
+            let last = lines.last(where: { $0.contains("Error") }) ?? lines.last ?? "exit code \(r.status)"
+            return (false, last)
+        } catch {
+            return (false, error.localizedDescription)
+        }
+    }
 
     // MARK: - Demucs
 
@@ -163,7 +241,7 @@ enum StemSeparator {
         }
         let S = kinds.count
 
-        let core = 256, halo = 8
+        let core = 256, halo = 12
         // accumulators: [stem][channel] covering core*hop + n samples
         let accLen = core * hop + n
         var acc = [[[Float]]](repeating: [[Float]](repeating: [Float](repeating: 0, count: accLen), count: 2), count: S)
@@ -174,6 +252,7 @@ enum StemSeparator {
         var re = [Float](repeating: 0, count: half), im = [Float](repeating: 0, count: half)
         var tmpRe = [Float](repeating: 0, count: half), tmpIm = [Float](repeating: 0, count: half)
         var timeOut = [Float](repeating: 0, count: n)
+        var masks = [[Float]](repeating: [Float](repeating: 0, count: half), count: 4)
 
         func forward(_ x: [Float], frame f: Int, into reOut: inout [Float], _ imOut: inout [Float]) {
             for i in 0..<n { frameBuf[i] = sample(x, f * hop + i) * window[i] }
@@ -228,41 +307,47 @@ enum StemSeparator {
             }
 
             // Harmonic (median over time) and percussive (median over frequency) envelopes
-            let harm = MetalCompute.medianFilter(mag, frames: m, bins: half, alongTime: true, radius: 8)
+            let harm = MetalCompute.medianFilter(mag, frames: m, bins: half, alongTime: true, radius: 12)
                 ?? cpuMedian(mag, frames: m, bins: half, alongTime: true, radius: 4)
-            let perc = MetalCompute.medianFilter(mag, frames: m, bins: half, alongTime: false, radius: 8)
+            let perc = MetalCompute.medianFilter(mag, frames: m, bins: half, alongTime: false, radius: 12)
                 ?? cpuMedian(mag, frames: m, bins: half, alongTime: false, radius: 4)
 
-            // Reset accumulator region for this chunk (tail carried below)
             for f in chunkStart..<chunkEnd {
                 let row = f - a
                 let base = row * half
+                // 1) masks for this frame (computed once, shared by both channels)
+                for k in 0..<half {
+                    let h2 = harm[base + k] * harm[base + k]
+                    let p2 = perc[base + k] * perc[base + k]
+                    // three-way split with a separation margin (β = 2):
+                    // steady tones → harmonic, broadband hits → percussive, the rest (vibrato,
+                    // sliding voices, noise) → residual
+                    let mh = h2 / (h2 + 4 * p2 + 1e-12)
+                    let mp = p2 / (p2 + 4 * h2 + 1e-12)
+                    let mr = max(0, 1 - mh - mp)
+
+                    let lr = specLr[base + k], li = specLi[base + k]
+                    let rr = specRr[base + k], ri = specRi[base + k]
+                    let cross = lr * rr + li * ri
+                    let energy = lr * lr + li * li + rr * rr + ri * ri
+                    let psi = max(0, min(1, 2 * cross / (energy + 1e-12)))
+                    let center = psi * psi * psi * psi
+
+                    let mDrums = mp
+                    let mBass = (mh + mr) * bassW[k]
+                    let mVocal = (mr + 0.6 * mh) * (1 - bassW[k]) * center * vocalBand[k]
+                    masks[0][k] = mVocal
+                    masks[1][k] = mDrums
+                    masks[2][k] = mBass
+                    masks[3][k] = max(0, 1 - mVocal - mDrums - mBass)
+                }
+                // 2) apply masks and resynthesise every stem / channel
                 for s in 0..<S {
-                    // build masked spectra for both channels
                     for ch in 0..<2 {
                         for k in 0..<half {
-                            let h = harm[base + k], p = perc[base + k]
-                            let h2 = h * h, p2 = p * p
-                            let mh = h2 / (h2 + p2 + 1e-12)
-                            let lr = specLr[base + k], li = specLi[base + k]
-                            let rr = specRr[base + k], ri = specRi[base + k]
-                            let cross = lr * rr + li * ri
-                            let energy = lr * lr + li * li + rr * rr + ri * ri
-                            let psi = max(0, min(1, 2 * cross / (energy + 1e-12)))
-                            let center = psi * psi * psi
-                            let mBass = mh * bassW[k]
-                            let mVocal = mh * (1 - bassW[k]) * center * vocalBand[k]
-                            let mDrums = 1 - mh
-                            let mask: Float
-                            switch s {
-                            case 0: mask = mVocal
-                            case 1: mask = mDrums
-                            case 2: mask = mBass
-                            default: mask = max(0, 1 - mVocal - mDrums - mBass)
-                            }
-                            let r0 = ch == 0 ? lr : rr, i0 = ch == 0 ? li : ri
-                            tmpRe[k] = r0 * mask
-                            tmpIm[k] = i0 * mask
+                            let mask = masks[s][k]
+                            tmpRe[k] = (ch == 0 ? specLr[base + k] : specRr[base + k]) * mask
+                            tmpIm[k] = (ch == 0 ? specLi[base + k] : specRi[base + k]) * mask
                         }
                         inverse(&tmpRe, &tmpIm)
                         let offset = f * hop - accStart

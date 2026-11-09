@@ -119,7 +119,8 @@ struct GuitarChordView: View {
         Canvas { ctx, size in
             let strings = 6
             let topPad = size.height * 0.16          // room for x / o markers
-            let leftPad = size.width * 0.16           // room for fret number
+            let compact = size.width < 70
+            let leftPad = max(size.width * 0.16, compact ? 10 : 14)   // room for fret number
             let rightPad = size.width * 0.06
             let bottomPad = size.height * 0.04
             let gridW = size.width - leftPad - rightPad
@@ -154,9 +155,10 @@ struct GuitarChordView: View {
             }
 
             if base > 1 {
-                ctx.draw(Text("\(base)fr").font(.system(size: max(8, fy * 0.42), weight: .semibold, design: .rounded))
+                ctx.draw(Text(compact ? "\(base)" : "\(base)fr")
+                            .font(.system(size: compact ? 8 : max(8, min(11, fy * 0.42)), weight: .semibold, design: .rounded))
                             .foregroundColor(theme.subtextColor),
-                         at: CGPoint(x: leftPad * 0.45, y: topPad + fy * 0.5))
+                         at: CGPoint(x: leftPad / 2 - 1, y: topPad + fy * 0.5))
             }
 
             let dotR = min(sx, fy) * 0.36
@@ -203,14 +205,14 @@ struct ChordShapeCard: View {
     let isCurrent: Bool
 
     var body: some View {
-        VStack(spacing: 4) {
+        VStack(spacing: 3) {
             Text(segment.name(transpose: transpose))
-                .font(.system(size: 12, weight: .bold, design: .rounded))
+                .font(.system(size: 11.5, weight: .bold, design: .rounded))
                 .foregroundStyle(isCurrent ? theme.accentColor : theme.textColor)
             ChordDiagramView(style: style, segment: segment, transpose: transpose)
-                .frame(width: style == .guitar ? 58 : 84, height: style == .guitar ? 66 : 34)
+                .frame(width: style == .guitar ? 50 : 76, height: style == .guitar ? 56 : 30)
         }
-        .padding(6)
+        .padding(5)
         .background(
             RoundedRectangle(cornerRadius: 9, style: .continuous)
                 .fill(isCurrent ? theme.accentColor.opacity(0.12) : theme.elevatedColor)

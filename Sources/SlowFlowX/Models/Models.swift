@@ -70,6 +70,10 @@ struct SongAnalysis: Codable, Hashable {
     var peaks: [Float]
     var analyzedAt: Date
     var usedMetal: Bool
+    /// True once the user set the tempo (tap / tempo menu / beat here) – never overwritten automatically.
+    var tempoLocked: Bool? = nil
+    /// Time of the first beat (seconds), when known.
+    var beatOffset: Double? = nil
 
     func keyName(transpose: Int = 0) -> String {
         ChordNaming.noteName(keyRoot + transpose) + (keyIsMinor ? " minor" : " major")

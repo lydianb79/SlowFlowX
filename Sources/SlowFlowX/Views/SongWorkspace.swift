@@ -20,7 +20,7 @@ struct SongWorkspace: View {
     let song: Song
 
     /// Below this the lower panel would get cramped, so the workspace scrolls instead of overlapping.
-    private let minLowerHeight: CGFloat = 380
+    private let minLowerHeight: CGFloat = 470
     private let spacing: CGFloat = 14
 
     var body: some View {

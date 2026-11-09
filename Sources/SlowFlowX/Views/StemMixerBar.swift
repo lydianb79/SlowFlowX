@@ -35,6 +35,24 @@ struct StemMixerBar: View {
                 .controlSize(.mini)
                 .help("Play the separated stems instead of the original mix")
 
+                if stems.engine == .builtin {
+                    Button {
+                        if model.tools.demucsReady {
+                            model.separateStems(song.id, engine: .demucs)
+                        } else {
+                            model.showDemucsInstaller = true
+                        }
+                    } label: {
+                        Label(model.tools.demucsReady ? "Quick stems · Redo with Demucs"
+                              : (model.tools.demucsBroken ? "Quick stems · Repair Demucs" : "Quick stems · Install Demucs"),
+                              systemImage: "exclamationmark.triangle.fill")
+                            .font(.system(size: 11, weight: .semibold))
+                    }
+                    .buttonStyle(GhostButtonStyle(active: true))
+                    .help("These stems come from the quick built-in separator, which can only roughly split a mix. Demucs (AI) produces real, clean stems.")
+                } else {
+                    Badge(text: "Demucs · \(stems.model)", tint: theme.accent2Color)
+                }
                 if player.usingStems {
                     ScrollView(.horizontal, showsIndicators: false) {
                         HStack(spacing: 8) {
@@ -70,14 +88,32 @@ struct StemMixerBar: View {
                     .foregroundStyle(theme.subtextColor)
                     .lineLimit(1)
                 Spacer(minLength: 8)
-                Button {
-                    model.separateStems(song.id, engine: .demucs)
-                } label: {
-                    Label("Separate (Demucs AI)", systemImage: "wand.and.stars")
+                if model.tools.demucsChecking {
+                    HStack(spacing: 6) {
+                        ProgressView().controlSize(.small)
+                        Text("Checking Demucs…").font(.system(size: 11.5)).foregroundStyle(theme.subtextColor)
+                    }
+                } else if !model.tools.demucsReady {
+                    Button {
+                        model.showDemucsInstaller = true
+                    } label: {
+                        Label(model.demucsInstalling ? "Installing Demucs…"
+                              : (model.tools.demucsBroken ? "Repair Demucs" : "Install Demucs (AI)"),
+                              systemImage: model.tools.demucsBroken ? "wrench.and.screwdriver" : "arrow.down.circle")
+                    }
+                    .buttonStyle(PrimaryButtonStyle())
+                    .help(model.tools.demucsBroken
+                          ? "Demucs is installed but doesn't run: \(model.tools.demucsProblem ?? "unknown error"). Click to repair."
+                          : "One-click install of Demucs, the AI separator. Needed for clean stems.")
+                } else {
+                    Button {
+                        model.separateStems(song.id, engine: .demucs)
+                    } label: {
+                        Label("Separate (Demucs AI)", systemImage: "wand.and.stars")
+                    }
+                    .buttonStyle(PrimaryButtonStyle())
+                    .help("High-quality AI separation (\(DemucsModel.current.rawValue))")
                 }
-                .buttonStyle(PrimaryButtonStyle())
-                .disabled(model.tools.demucs == nil)
-                .help(model.tools.demucs == nil ? "Install Demucs first (see Settings › Tools):  " + StemSeparator.installCommand : "High-quality AI separation (\(DemucsModel.current.rawValue))")
                 Button("Quick (built-in)") { model.separateStems(song.id, engine: .builtin) }
                     .buttonStyle(GhostButtonStyle())
                     .help("Fast spectral separation without extra software (4 stems, lower quality)")

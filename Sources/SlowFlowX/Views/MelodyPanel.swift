@@ -30,7 +30,6 @@ struct MelodyPanel: View {
     @AppStorage("melodySource") private var sourceRaw = MelodySource.vocal.rawValue
     @AppStorage("melodyViewStyle") private var styleRaw = MelodyViewStyle.tab.rawValue
     @AppStorage("melodyWindowSeconds") private var windowSeconds = 8.0
-    @AppStorage("melodyQuantize") private var quantize = 0          // 0 off, 1 = 16ths, 2 = 8ths
     let song: Song
 
     private var source: MelodySource { MelodySource(rawValue: sourceRaw) ?? .vocal }
@@ -80,7 +79,7 @@ struct MelodyPanel: View {
             }
 
             if let track, !track.isEmpty {
-                RhythmToolbar(song: song, track: track, quantize: $quantize, windowSeconds: $windowSeconds)
+                RhythmToolbar(song: song, track: track, style: style, windowSeconds: $windowSeconds)
             }
 
             if let status = model.melodyStatus[key] {
@@ -99,20 +98,16 @@ struct MelodyPanel: View {
                 Group {
                     switch style {
                     case .tab:
-                        if track.source.isRhythm {
-                            StrumTabView(track: track, chords: chords, grid: grid, quantize: quantize,
-                                         time: player.currentTime, window: windowSeconds, transpose: transpose,
-                                         onSeek: { player.seek(to: $0) })
-                        } else {
-                            TabStaffView(track: track,
-                                         positions: FingeringCache.positions(songID: song.id, track: track, transpose: transpose),
-                                         chords: chords, grid: grid, quantize: quantize,
-                                         time: player.currentTime, window: windowSeconds, transpose: transpose,
-                                         onSeek: { player.seek(to: $0) })
-                        }
+                        TabSheetView(events: Self.sheetEvents(song: song, track: track, chords: chords,
+                                                              grid: grid, transpose: transpose),
+                                     instrument: track.source.tabInstrument,
+                                     showsStrokes: track.source.isRhythm,
+                                     chords: chords, grid: grid,
+                                     time: player.currentTime, transpose: transpose,
+                                     onSeek: { player.seek(to: $0) })
                     case .piano:
                         PianoRollView(notes: track.displayNotes(chords: chords),
-                                      chords: chords, grid: grid, quantize: quantize,
+                                      chords: chords, grid: grid, quantize: 0,
                                       time: player.currentTime, window: windowSeconds, transpose: transpose,
                                       onSeek: { player.seek(to: $0) })
                     }
@@ -159,6 +154,32 @@ struct MelodyPanel: View {
         .onChange(of: key) { _, _ in autoTranscribe() }
     }
 
+    /// Notes (or strums) placed on the 16th-note grid for the sheet-style tab.
+    @MainActor static func sheetEvents(song: Song, track: MelodyTrack, chords: [ChordSegment],
+                            grid: RhythmGrid, transpose: Int) -> [SheetEvent] {
+        if track.source.isRhythm {
+            let strums = track.strums ?? []
+            let q = RhythmQuantizer.quantize(starts: strums.map(\.start), ends: strums.map(\.end), grid: grid, resolution: 1)
+            return q.map { e in
+                let s = strums[e.index]
+                var frets: [Int: Int] = [:]
+                if let c = MelodyTrack.chord(at: s.start + 0.02, in: chords),
+                   let v = GuitarChords.voicing(root: (c.root + transpose + 12) % 12, quality: c.quality) {
+                    for (i, f) in v.frets.enumerated() where f >= 0 { frets[i] = f }
+                }
+                return SheetEvent(grid: e, start: s.start, end: s.end, frets: frets, mark: nil, down: s.down)
+            }
+        }
+        let positions = FingeringCache.positions(songID: song.id, track: track, transpose: transpose)
+        let q = RhythmQuantizer.quantize(starts: track.notes.map(\.start), ends: track.notes.map(\.end), grid: grid, resolution: 1)
+        return q.compactMap { e in
+            guard e.index < positions.count else { return nil }
+            let n = track.notes[e.index], p = positions[e.index]
+            return SheetEvent(grid: e, start: n.start, end: n.end, frets: [p.string: p.fret],
+                              mark: p.octaveShift == 0 ? nil : (p.octaveShift > 0 ? "8vb" : "8va"), down: nil)
+        }
+    }
+
     /// Transcribe automatically the first time a part is shown.
     private func autoTranscribe() {
         let key = AppModel.melodyKey(song.id, source)
@@ -171,51 +192,59 @@ struct MelodyPanel: View {
 // MARK: - Rhythm toolbar (grid, tempo, zoom)
 
 private struct RhythmToolbar: View {
+    static let tempoFactors: [Double] = [0.5, 2.0 / 3.0, 1.5, 2.0]
+    static let tempoLabels: [String] = ["½× (half time)", "⅔×", "1.5×", "2× (double time)"]
     @Environment(AppModel.self) private var model
     @Environment(\.appTheme) private var theme
     let song: Song
     let track: MelodyTrack
-    @Binding var quantize: Int
+    let style: MelodyViewStyle
     @Binding var windowSeconds: Double
 
     var body: some View {
         let grid = track.grid(fallbackBPM: song.analysis?.bpm ?? 0)
         HStack(spacing: 10) {
-            Text("GRID")
-                .font(.system(size: 10, weight: .semibold)).tracking(1)
-                .foregroundStyle(theme.subtextColor)
-            Picker("Grid", selection: $quantize) {
-                Text("Off").tag(0)
-                Text("1/8").tag(2)
-                Text("1/16").tag(1)
+            BeatLight(grid: grid, time: model.player.currentTime)
+                .help("Flashes on every beat (bright on beat 1). If it doesn't pulse with the music, fix the tempo with Tap or the tempo menu.")
+
+            Menu {
+                Section("Tempo is often detected at a related speed") {
+                    ForEach(0..<Self.tempoFactors.count, id: \.self) { i in
+                        let v = (grid.bpm * Self.tempoFactors[i] * 2).rounded() / 2
+                        Button("\(Self.tempoLabels[i]) → \(Int(v.rounded())) BPM") {
+                            model.setMelodyTempo(song.id, source: track.source, bpm: v)
+                        }
+                        .disabled(v < 40 || v > 240)
+                    }
+                }
+                Divider()
+                if song.stems?.files[StemKind.drums.rawValue] != nil {
+                    Button("Detect from Drums Stem") { model.retempoFromDrums(song.id, force: true) }
+                }
+                Button("−1 BPM") { model.setMelodyTempo(song.id, source: track.source, bpm: (grid.bpm - 1).rounded()) }
+                Button("+1 BPM") { model.setMelodyTempo(song.id, source: track.source, bpm: (grid.bpm + 1).rounded()) }
+            } label: {
+                Text("♩ = \(Int(grid.bpm.rounded()))")
+                    .font(.system(size: 12, weight: .bold, design: .monospaced))
             }
-            .pickerStyle(.segmented)
-            .labelsHidden()
+            .menuStyle(.borderlessButton)
             .fixedSize()
-            .help("Snap notes to the beat grid (display and export)")
+            .help("Tempo of the song. Choose a related tempo if the beat light runs at half/double speed.")
 
-            Rectangle().fill(theme.borderColor).frame(width: 1, height: 18)
-
-            Image(systemName: "metronome").font(.system(size: 11)).foregroundStyle(theme.accentColor)
-            Text("♩ = \(Int(grid.bpm.rounded()))")
-                .font(.system(size: 12, weight: .bold, design: .monospaced))
-                .foregroundStyle(theme.textColor)
-                .frame(minWidth: 58, alignment: .leading)
             Group {
-                Button("½×") { model.setMelodyTempo(song.id, source: track.source, bpm: grid.bpm / 2) }
-                    .help("Half tempo")
-                Button("2×") { model.setMelodyTempo(song.id, source: track.source, bpm: grid.bpm * 2) }
-                    .help("Double tempo")
-                Button { model.setMelodyTempo(song.id, source: track.source, bpm: (grid.bpm - 1).rounded()) } label: { Image(systemName: "minus") }
-                    .help("Tempo −1")
-                Button { model.setMelodyTempo(song.id, source: track.source, bpm: (grid.bpm + 1).rounded()) } label: { Image(systemName: "plus") }
-                    .help("Tempo +1")
+                Button {
+                    model.tapTempo(song.id)
+                } label: {
+                    Label(model.tapCount >= 4 ? "Tap (\(model.tapCount))" : (model.tapCount > 0 ? "Tap \(model.tapCount)/4" : "Tap"),
+                          systemImage: "hand.tap")
+                }
+                .help("While the song plays, tap along on the beat (4+ taps, ideally starting on beat 1). Sets tempo and bar lines for the whole song — works at any playback speed.")
                 Button {
                     model.alignBeat(song.id, source: track.source, at: model.player.currentTime)
                 } label: {
                     Label("Beat Here", systemImage: "scope")
                 }
-                .help("Move the beat grid so a beat falls at the playhead (use it on a clear downbeat)")
+                .help("Pause exactly on beat 1 of a bar and click: moves the bar lines there")
             }
             .buttonStyle(GhostButtonStyle())
 
@@ -231,33 +260,62 @@ private struct RhythmToolbar: View {
                 .help("Stems are available: transcribing from the isolated part is much more accurate")
             } else if song.stems == nil && !track.source.isRhythm {
                 Button {
-                    model.separateStems(song.id, engine: model.tools.demucs != nil ? .demucs : .builtin)
+                    model.separateStems(song.id, engine: model.tools.demucsReady ? .demucs : .builtin)
                 } label: {
                     Label("Separate Stems for Accuracy", systemImage: "slider.vertical.3")
                 }
                 .buttonStyle(GhostButtonStyle())
                 .help("Isolating the part first gives much better transcriptions")
             }
-            if track.beatOffset == nil {
+            if track.isOutdated {
                 Button {
                     model.analyzeMelody(song.id, source: track.source)
                 } label: {
                     Label("Update Transcription", systemImage: "arrow.clockwise")
                 }
                 .buttonStyle(GhostButtonStyle(active: true))
-                .help("This part was transcribed with an older version. Transcribe again for accurate note lengths and beat grid.")
+                .help("This part was transcribed with an older version. Transcribe again for the improved tempo, beat grid, fingering and note detection.")
             }
 
             Spacer(minLength: 8)
 
-            HStack(spacing: 4) {
-                Image(systemName: "plus.magnifyingglass").font(.system(size: 10)).foregroundStyle(theme.subtextColor)
-                Slider(value: $windowSeconds, in: 3...24)
-                    .frame(width: 90)
-                Image(systemName: "minus.magnifyingglass").font(.system(size: 10)).foregroundStyle(theme.subtextColor)
+            if style == .piano {
+                HStack(spacing: 4) {
+                    Image(systemName: "plus.magnifyingglass").font(.system(size: 10)).foregroundStyle(theme.subtextColor)
+                    Slider(value: $windowSeconds, in: 3...24)
+                        .frame(width: 90)
+                    Image(systemName: "minus.magnifyingglass").font(.system(size: 10)).foregroundStyle(theme.subtextColor)
+                }
+                .help("Visible time window (zoom)")
             }
-            .help("Visible time window (zoom)")
         }
+    }
+}
+
+/// Four dots that light up on each beat; the first (bar start) is accented.
+private struct BeatLight: View {
+    @Environment(\.appTheme) private var theme
+    let grid: RhythmGrid
+    let time: Double
+
+    var body: some View {
+        let beatPos = (time - grid.offset) / grid.beat
+        let beatIndex = Int(beatPos.rounded(.down))
+        let frac = beatPos - Double(beatIndex)
+        let inBar = ((beatIndex % 4) + 4) % 4
+        let flash = frac < 0.22
+        HStack(spacing: 4) {
+            ForEach(0..<4, id: \.self) { i in
+                Circle()
+                    .fill(i == inBar
+                          ? (i == 0 ? theme.accent2Color : theme.accentColor).opacity(flash ? 1 : 0.45)
+                          : theme.subtextColor.opacity(0.2))
+                    .frame(width: i == 0 ? 9 : 7, height: i == 0 ? 9 : 7)
+            }
+        }
+        .padding(.horizontal, 6)
+        .padding(.vertical, 5)
+        .background(Capsule().fill(theme.elevatedColor))
     }
 }
 
@@ -301,9 +359,10 @@ private struct NowNoteBar: View {
             Text("NOTE")
                 .font(.system(size: 10, weight: .semibold)).tracking(1.2)
                 .foregroundStyle(theme.subtextColor)
-            Text(idx.map { track.notes[$0].name(transpose: transpose) } ?? "—")
-                .font(.system(size: 30, weight: .heavy, design: .rounded))
-                .foregroundStyle(theme.accentGradient)
+            Text(idx.map { track.notes[$0].name(transpose: transpose) } ?? "rest")
+                .font(.system(size: idx == nil ? 18 : 30, weight: .heavy, design: .rounded))
+                .foregroundStyle(idx == nil ? AnyShapeStyle(theme.subtextColor.opacity(0.6)) : AnyShapeStyle(theme.accentGradient))
+                .frame(height: 36, alignment: .leading)
                 .frame(minWidth: 80, alignment: .leading)
         }
         HStack(spacing: 6) {
@@ -520,177 +579,186 @@ private func displayTimes(_ starts: [Double], _ ends: [Double], grid: RhythmGrid
             events.map { grid.time(ofStep: Double($0.endStep)) })
 }
 
-// MARK: - Guitar / bass tab (pitched parts)
+// MARK: - Sheet-style tab
 
-private struct TabStaffView: View {
-    @Environment(\.appTheme) private var theme
-    let track: MelodyTrack
-    let positions: [TabPosition]
-    let chords: [ChordSegment]
-    let grid: RhythmGrid
-    let quantize: Int
-    let time: Double
-    let window: Double
-    let transpose: Int
-    let onSeek: (Double) -> Void
+struct SheetEvent {
+    let grid: GridEvent          // position on the 16th grid
+    let start: Double            // real time (for highlighting)
+    let end: Double
+    let frets: [Int: Int]        // string → fret
+    let mark: String?            // e.g. "8va"
+    let down: Bool?              // strum direction (rhythm part)
+}
 
-    private let left: CGFloat = 30
+/// Layout shared by drawing and hit-testing.
+private struct SheetLayout {
+    let size: CGSize
+    let strings: Int
+    let showsStrokes: Bool
+    let currentStep: Double
 
-    var body: some View {
-        let instrument = track.source.tabInstrument
-        let timing = displayTimes(track.notes.map(\.start), track.notes.map(\.end), grid: grid, quantize: quantize)
-        Canvas { ctx, size in
-            let tl = Timeline(time: time, window: window, left: left, width: size.width - left)
-            let strings = instrument.tuning.count
-            let top: CGFloat = 34, bottom = size.height - 34
-            let gap = (bottom - top) / CGFloat(max(strings - 1, 1))
-            func y(_ s: Int) -> CGFloat { top + CGFloat(strings - 1 - s) * gap }   // highest string on top
+    let left: CGFloat = 24
+    let gap: CGFloat = 13
+    var chordRow: CGFloat { 16 }
+    var strokeRow: CGFloat { showsStrokes ? 14 : 0 }
+    var staffHeight: CGFloat { gap * CGFloat(strings - 1) }
+    var rhythmRow: CGFloat { 30 }
+    var systemHeight: CGFloat { 6 + chordRow + strokeRow + staffHeight + rhythmRow }
+    var usableWidth: CGFloat { max(100, size.width - left - 8) }
+    var barsPerRow: Int { max(1, min(8, Int(usableWidth / 210))) }
+    var barWidth: CGFloat { usableWidth / CGFloat(barsPerRow) }
+    var rows: Int { max(1, Int(size.height / systemHeight)) }
+    var currentBar: Int { floorDiv(Int(currentStep.rounded(.down)), 16) }
+    var currentRow: Int { floorDiv(currentBar, barsPerRow) }
+    /// The page shows the current line (plus the previous one when there is room).
+    var firstRow: Int { currentRow - (rows >= 3 ? 1 : 0) }
 
-            ctx.fill(Path(CGRect(origin: .zero, size: size)), with: .color(theme.elevatedColor))
-            drawBeatGrid(ctx, tl: tl, grid: grid, top: top - 8, bottom: bottom + 6, theme: theme,
-                         showSixteenths: window <= 6)
-            drawChordNames(ctx, tl: tl, chords: chords, transpose: transpose, y: 10, theme: theme)
+    func rowTop(_ r: Int) -> CGFloat { CGFloat(r) * systemHeight + 4 }
+    func staffTop(_ r: Int) -> CGFloat { rowTop(r) + chordRow + strokeRow }
+    func y(string s: Int, row r: Int) -> CGFloat { staffTop(r) + CGFloat(strings - 1 - s) * gap }
 
-            for s in 0..<strings {
-                ctx.fill(Path(CGRect(x: left, y: y(s) - 0.5, width: size.width - left, height: 1)),
-                         with: .color(theme.subtextColor.opacity(0.45)))
-                ctx.draw(Text(instrument.stringNames[s]).font(.system(size: 11, weight: .bold, design: .monospaced))
-                            .foregroundColor(theme.subtextColor),
-                         at: CGPoint(x: left / 2, y: y(s)))
-            }
-            ctx.fill(Path(CGRect(x: left - 2, y: top, width: 2, height: bottom - top)), with: .color(theme.subtextColor.opacity(0.6)))
+    /// x for a (fractional) 16th step inside line `rowIndex`.
+    func x(step: Double, rowIndex: Int) -> CGFloat {
+        let rowStartStep = Double(rowIndex * barsPerRow * 16)
+        let rel = step - rowStartStep
+        let bar = (rel / 16).rounded(.down)
+        let within = rel - bar * 16
+        return left + CGFloat(bar) * barWidth + 10 + CGFloat(within / 16) * (barWidth - 20)
+    }
 
-            let fontSize = min(13, max(9, gap * 0.62))
-            var rhythmItems: [(x: CGFloat, event: GridEvent, active: Bool)] = []
-            for i in track.notes.indices where i < positions.count && i < timing.events.count {
-                let start = timing.start[i], end = timing.end[i]
-                guard end > tl.start && start < tl.end else { continue }
-                let n = track.notes[i]
-                let p = positions[i]
-                let x0 = max(tl.x(start), left), x1 = tl.x(end)
-                let yy = y(p.string)
-                let active = n.start <= time && time < n.end
-                let past = n.end <= time
-                let color = active ? theme.accentColor : theme.accent2Color
-
-                if x1 > x0 + 4 {
-                    ctx.fill(Path(roundedRect: CGRect(x: x0, y: yy - 2, width: x1 - x0, height: 4), cornerRadius: 2),
-                             with: .color(color.opacity(past ? 0.18 : 0.38)))
-                }
-                let label = ctx.resolve(Text("\(p.fret)")
-                    .font(.system(size: fontSize, weight: .bold, design: .rounded))
-                    .foregroundColor(active ? .white : (past ? theme.subtextColor : theme.textColor)))
-                let sz = label.measure(in: size)
-                let pillW = max(sz.width + 8, sz.height + 4)
-                let pill = CGRect(x: x0 - pillW / 2, y: yy - sz.height / 2 - 2, width: pillW, height: sz.height + 4)
-                ctx.fill(Path(roundedRect: pill, cornerRadius: pill.height / 2),
-                         with: .color(active ? theme.accentColor : theme.surfaceColor))
-                ctx.stroke(Path(roundedRect: pill, cornerRadius: pill.height / 2),
-                           with: .color(color.opacity(past ? 0.3 : 0.8)), lineWidth: 1)
-                ctx.draw(label, at: CGPoint(x: pill.midX, y: pill.midY))
-                if p.octaveShift != 0 {
-                    ctx.draw(Text(p.octaveShift > 0 ? "8vb" : "8va").font(.system(size: 7.5, weight: .semibold))
-                                .foregroundColor(theme.subtextColor),
-                             at: CGPoint(x: pill.midX, y: pill.minY - 5))
-                }
-                if tl.x(start) >= left { rhythmItems.append((tl.x(start), timing.events[i], active)) }
-            }
-            drawRhythm(ctx, items: rhythmItems, top: bottom + 10, theme: theme)
-
-            let px = tl.x(time)
-            ctx.fill(Path(CGRect(x: px - 1, y: 0, width: 2, height: size.height)), with: .color(theme.accent2Color))
-        }
-        .modifier(ScrubModifier(time: time, window: window, left: left, onSeek: onSeek))
+    /// Step at a point (for click-to-seek).
+    func step(at p: CGPoint) -> Double? {
+        let r = Int(p.y / systemHeight)
+        guard r >= 0 && r < rows, p.x >= left else { return nil }
+        let rowIndex = firstRow + r
+        let bar = min(barsPerRow - 1, Int((p.x - left) / barWidth))
+        let within = Double((p.x - left - CGFloat(bar) * barWidth - 10) / max(barWidth - 20, 1)) * 16
+        return Double(rowIndex * barsPerRow * 16 + bar * 16) + min(max(within, 0), 15.99)
     }
 }
 
-// MARK: - Rhythm guitar tab (strums)
-
-private struct StrumTabView: View {
+/// Printed-tab style: several bars per line, stacked lines, the current bar highlighted and the
+/// page turning as the song plays. Notes sit on a 16th-note grid with rhythm stems underneath.
+private struct TabSheetView: View {
     @Environment(\.appTheme) private var theme
-    let track: MelodyTrack
+    let events: [SheetEvent]
+    let instrument: TabInstrument
+    let showsStrokes: Bool
     let chords: [ChordSegment]
     let grid: RhythmGrid
-    let quantize: Int
     let time: Double
-    let window: Double
     let transpose: Int
     let onSeek: (Double) -> Void
 
-    private let left: CGFloat = 30
-
     var body: some View {
-        let strums = track.strums ?? []
-        let timing = displayTimes(strums.map(\.start), strums.map(\.end), grid: grid, quantize: quantize)
-        Canvas { ctx, size in
-            let tl = Timeline(time: time, window: window, left: left, width: size.width - left)
-            let strings = 6
-            let top: CGFloat = 44, bottom = size.height - 34
-            let gap = (bottom - top) / CGFloat(strings - 1)
-            func y(_ s: Int) -> CGFloat { top + CGFloat(strings - 1 - s) * gap }
+        GeometryReader { geo in
+            let layout = SheetLayout(size: geo.size, strings: instrument.tuning.count,
+                                     showsStrokes: showsStrokes, currentStep: grid.stepPosition(time))
+            Canvas { ctx, size in
+                ctx.fill(Path(CGRect(origin: .zero, size: size)), with: .color(theme.elevatedColor))
+                let names = instrument.stringNames
+                let strings = instrument.tuning.count
 
-            ctx.fill(Path(CGRect(origin: .zero, size: size)), with: .color(theme.elevatedColor))
-            drawBeatGrid(ctx, tl: tl, grid: grid, top: top - 8, bottom: bottom + 6, theme: theme,
-                         showSixteenths: window <= 8)
-            drawChordNames(ctx, tl: tl, chords: chords, transpose: transpose, y: 10, theme: theme)
+                for r in 0..<layout.rows {
+                    let rowIndex = layout.firstRow + r
+                    let rowStartStep = rowIndex * layout.barsPerRow * 16
+                    let rowEndStep = rowStartStep + layout.barsPerRow * 16
+                    let top = layout.staffTop(r), bottom = top + layout.staffHeight
+                    let rowEndX = layout.left + layout.barWidth * CGFloat(layout.barsPerRow)
 
-            let names = TabInstrument.guitar.stringNames
-            for s in 0..<strings {
-                ctx.fill(Path(CGRect(x: left, y: y(s) - 0.5, width: size.width - left, height: 1)),
-                         with: .color(theme.subtextColor.opacity(0.45)))
-                ctx.draw(Text(names[s]).font(.system(size: 11, weight: .bold, design: .monospaced))
-                            .foregroundColor(theme.subtextColor),
-                         at: CGPoint(x: left / 2, y: y(s)))
-            }
-            ctx.fill(Path(CGRect(x: left - 2, y: top, width: 2, height: bottom - top)), with: .color(theme.subtextColor.opacity(0.6)))
-
-            let fontSize = min(11, max(8, gap * 0.6))
-            var rhythmItems: [(x: CGFloat, event: GridEvent, active: Bool)] = []
-            for i in strums.indices where i < timing.events.count {
-                let start = timing.start[i], end = timing.end[i]
-                guard end > tl.start && start < tl.end else { continue }
-                let s = strums[i]
-                let x = tl.x(start)
-                guard x >= left - 4 else { continue }
-                let active = s.start <= time && time < s.end
-                let past = s.end <= time
-                let colColor = s.down ? theme.accentColor : theme.accent2Color
-
-                if active {
-                    ctx.fill(Path(roundedRect: CGRect(x: x - 9, y: top - 6, width: 18, height: bottom - top + 12), cornerRadius: 5),
-                             with: .color(theme.accentColor.opacity(0.16)))
-                }
-                // strum arrow (length/opacity follow strength)
-                let a = 0.45 + Double(min(s.strength, 1)) * 0.55
-                ctx.draw(Text(s.down ? "↓" : "↑").font(.system(size: 13, weight: .heavy))
-                            .foregroundColor(colColor.opacity(past ? a * 0.5 : a)),
-                         at: CGPoint(x: x, y: top - 14))
-
-                // chord shape stacked on the strings
-                if let c = MelodyTrack.chord(at: s.start + 0.02, in: chords),
-                   let v = GuitarChords.voicing(root: (c.root + transpose + 12) % 12, quality: c.quality) {
-                    for str in 0..<strings {
-                        let f = v.frets[str]
-                        let text = f < 0 ? "x" : "\(f)"
-                        ctx.draw(Text(text).font(.system(size: fontSize, weight: .bold, design: .rounded))
-                                    .foregroundColor(active ? theme.textColor : (past ? theme.subtextColor.opacity(0.6) : theme.textColor.opacity(0.85))),
-                                 at: CGPoint(x: x, y: y(str)))
+                    // current bar highlight
+                    if layout.currentRow == rowIndex {
+                        let b = layout.currentBar - rowIndex * layout.barsPerRow
+                        ctx.fill(Path(roundedRect: CGRect(x: layout.left + CGFloat(b) * layout.barWidth, y: layout.rowTop(r),
+                                                          width: layout.barWidth, height: layout.systemHeight - 6), cornerRadius: 6),
+                                 with: .color(theme.accentColor.opacity(0.07)))
                     }
-                } else {
-                    // no chord known: show a muted strum
-                    for str in 0..<strings {
-                        ctx.draw(Text("x").font(.system(size: fontSize, weight: .bold)).foregroundColor(theme.subtextColor),
-                                 at: CGPoint(x: x, y: y(str)))
+                    // strings
+                    for s in 0..<strings {
+                        ctx.fill(Path(CGRect(x: layout.left, y: layout.y(string: s, row: r) - 0.5, width: rowEndX - layout.left, height: 1)),
+                                 with: .color(theme.subtextColor.opacity(0.4)))
+                        ctx.draw(Text(names[s]).font(.system(size: 9.5, weight: .bold, design: .monospaced))
+                                    .foregroundColor(theme.subtextColor),
+                                 at: CGPoint(x: layout.left / 2, y: layout.y(string: s, row: r)))
+                    }
+                    // bar lines + numbers + beat ticks
+                    for b in 0...layout.barsPerRow {
+                        let x = layout.left + CGFloat(b) * layout.barWidth
+                        ctx.fill(Path(CGRect(x: x - 0.6, y: top, width: 1.2, height: bottom - top)),
+                                 with: .color(theme.subtextColor.opacity(0.6)))
+                        if b < layout.barsPerRow {
+                            let barNumber = rowIndex * layout.barsPerRow + b + 1
+                            if barNumber > 0 {
+                                ctx.draw(Text("\(barNumber)").font(.system(size: 8.5, weight: .semibold, design: .monospaced))
+                                            .foregroundColor(theme.subtextColor.opacity(0.7)),
+                                         at: CGPoint(x: x + 3, y: top - 3), anchor: .bottomLeading)
+                            }
+                            for beat in 1..<4 {
+                                let bx = layout.x(step: Double(rowStartStep + b * 16 + beat * 4), rowIndex: rowIndex)
+                                ctx.fill(Path(CGRect(x: bx, y: bottom + 2, width: 0.6, height: 3)),
+                                         with: .color(theme.subtextColor.opacity(0.35)))
+                            }
+                        }
+                    }
+                    // chord names
+                    var lastChord = ""
+                    for seg in chords where seg.isChord {
+                        let st = Int(grid.stepPosition(seg.start).rounded())
+                        let en = Int(grid.stepPosition(seg.end).rounded())
+                        guard en > rowStartStep, st < rowEndStep else { continue }
+                        let name = seg.name(transpose: transpose)
+                        if name == lastChord { continue }
+                        lastChord = name
+                        let x = layout.x(step: Double(max(st, rowStartStep)), rowIndex: rowIndex)
+                        ctx.draw(Text(name).font(.system(size: 10.5, weight: .bold, design: .rounded))
+                                    .foregroundColor(theme.chordColor(root: (seg.root + transpose + 12) % 12)),
+                                 at: CGPoint(x: x - 4, y: layout.rowTop(r) + 6), anchor: .leading)
+                    }
+
+                    // notes / strums
+                    var rhythmItems: [(x: CGFloat, event: GridEvent, active: Bool)] = []
+                    for e in events where e.grid.startStep >= rowStartStep && e.grid.startStep < rowEndStep {
+                        let x = layout.x(step: Double(e.grid.startStep), rowIndex: rowIndex)
+                        let active = e.start <= time && time < e.end
+                        let past = e.end <= time
+                        if let down = e.down {
+                            ctx.draw(Text(down ? "↓" : "↑").font(.system(size: 11, weight: .heavy))
+                                        .foregroundColor((down ? theme.accentColor : theme.accent2Color).opacity(past ? 0.45 : 1)),
+                                     at: CGPoint(x: x, y: top - 10))
+                        }
+                        for (s, f) in e.frets.sorted(by: { $0.key < $1.key }) {
+                            let yy = layout.y(string: s, row: r)
+                            let label = ctx.resolve(Text("\(f)")
+                                .font(.system(size: 10.5, weight: .bold, design: .rounded))
+                                .foregroundColor(active ? .white : (past ? theme.subtextColor : theme.textColor)))
+                            let sz = label.measure(in: size)
+                            let w = max(sz.width + 5, 13)
+                            let rect = CGRect(x: x - w / 2, y: yy - 6.5, width: w, height: 13)
+                            ctx.fill(Path(roundedRect: rect, cornerRadius: 4),
+                                     with: .color(active ? theme.accentColor : theme.elevatedColor))
+                            ctx.draw(label, at: CGPoint(x: x, y: yy))
+                        }
+                        if let mark = e.mark, let s = e.frets.keys.first {
+                            ctx.draw(Text(mark).font(.system(size: 7, weight: .semibold)).foregroundColor(theme.subtextColor),
+                                     at: CGPoint(x: x, y: layout.y(string: s, row: r) - 10))
+                        }
+                        rhythmItems.append((x, e.grid, active))
+                    }
+                    drawRhythm(ctx, items: rhythmItems, top: bottom + 8, theme: theme)
+
+                    // playhead
+                    if layout.currentRow == rowIndex {
+                        let px = layout.x(step: layout.currentStep, rowIndex: rowIndex)
+                        ctx.fill(Path(CGRect(x: px - 1, y: top - 8, width: 2, height: bottom - top + 16)),
+                                 with: .color(theme.accent2Color))
                     }
                 }
-                rhythmItems.append((x, timing.events[i], active))
             }
-            drawRhythm(ctx, items: rhythmItems, top: bottom + 10, theme: theme)
-
-            let px = tl.x(time)
-            ctx.fill(Path(CGRect(x: px - 1, y: 0, width: 2, height: size.height)), with: .color(theme.accent2Color))
+            .contentShape(Rectangle())
+            .onTapGesture { p in
+                if let step = layout.step(at: p) { onSeek(max(0, grid.time(ofStep: step))) }
+            }
         }
-        .modifier(ScrubModifier(time: time, window: window, left: left, onSeek: onSeek))
     }
 }
 

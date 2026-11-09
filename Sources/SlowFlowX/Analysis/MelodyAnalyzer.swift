@@ -13,12 +13,18 @@ final class MelodyAnalyzer {
     let maxFreq: Double = 4200
     let chunkFrames = 2048
 
-    func analyze(url: URL, source: MelodySource, progress: @escaping (String, Double) -> Void) throws -> MelodyTrack {
+    /// - Parameters:
+    ///   - url: audio to transcribe (ideally the isolated stem)
+    ///   - rhythmURL: audio used for the beat grid — drums stem or full mix. Isolated vocals/guitar
+    ///     make poor tempo references, so the beat is taken from here when given.
+    ///   - tempoHint: tempo of the whole song (from the chord analysis), used when available
+    func analyze(url: URL, source: MelodySource, rhythmURL: URL? = nil, tempoHint: Double? = nil,
+                 progress: @escaping (String, Double) -> Void) throws -> MelodyTrack {
         progress("Decoding audio", 0.02)
         let x = try AudioLoader.loadMono(url: url, sampleRate: sampleRate)
         guard x.count > fftSize * 2 else { throw AnalysisError.tooShort }
 
-        if source.isRhythm { return analyzeRhythm(x, progress: progress) }
+        if source.isRhythm { return analyzeRhythm(x, rhythmURL: rhythmURL, tempoHint: tempoHint, progress: progress) }
 
         // Candidate fundamentals on a 20-cent grid.
         let range = source.frequencyRange
@@ -122,9 +128,7 @@ final class MelodyAnalyzer {
                        frames: frames, frameTime: frameTime, offset: offset, plucked: source.isPlucked)
 
         progress("Finding the beat", 0.98)
-        let bpm = ChordAnalyzer.estimateTempo(x, sampleRate: sampleRate)
-        let tempo = bpm > 30 ? bpm : 120
-        let beatOffset = OnsetDetector.beatOffset(onsetResult, bpm: tempo)
+        let (tempo, beatOffset) = beatGrid(fallback: x, rhythmURL: rhythmURL, tempoHint: tempoHint)
 
         progress("Done", 1)
         return MelodyTrack(source: source, notes: notes, analyzedAt: Date(), usedMetal: usedMetal,
@@ -198,18 +202,59 @@ final class MelodyAnalyzer {
         for i in out.indices.dropLast() where out[i].end > out[i + 1].start {
             out[i].end = max(out[i].start + 0.03, out[i + 1].start)
         }
-        return out
+        return Self.fixOctaveErrors(out)
+    }
+
+    /// Pitch trackers sometimes lock onto the octave above/below for a moment. A short note that sits
+    /// about an octave away from both neighbours (while they are close to each other) is folded back.
+    static func fixOctaveErrors(_ notes: [MelodyNote]) -> [MelodyNote] {
+        guard notes.count >= 3 else { return notes }
+        var out = notes
+        for i in 1..<(out.count - 1) {
+            let a = out[i - 1].midi, b = out[i].midi, c = out[i + 1].midi
+            guard out[i].duration < 0.35, abs(a - c) <= 5 else { continue }
+            let avg = Double(a + c) / 2
+            let dist = abs(Double(b) - avg)
+            if dist >= 9 {
+                if abs(Double(b - 12) - avg) <= 4 { out[i].midi = b - 12 }
+                else if abs(Double(b + 12) - avg) <= 4 { out[i].midi = b + 12 }
+            }
+        }
+        // merge neighbours that became the same pitch with (almost) no gap
+        var merged: [MelodyNote] = []
+        for n in out {
+            if var last = merged.last, last.midi == n.midi, n.start - last.end < 0.03 {
+                last.end = n.end
+                merged[merged.count - 1] = last
+            } else {
+                merged.append(n)
+            }
+        }
+        return merged
     }
 
     // MARK: - Rhythm part (strums)
 
-    private func analyzeRhythm(_ x: [Float], progress: @escaping (String, Double) -> Void) -> MelodyTrack {
+    /// Tempo and first-beat offset from the rhythm reference (drums stem / full mix).
+    private func beatGrid(fallback x: [Float], rhythmURL: URL?, tempoHint: Double?) -> (Double, Double) {
+        var audio = x
+        if let r = rhythmURL, let y = try? AudioLoader.loadMono(url: r, sampleRate: sampleRate), y.count > fftSize * 2 {
+            audio = y
+        }
+        let hint = tempoHint ?? 0
+        let estimated = hint > 30 ? hint : ChordAnalyzer.estimateTempo(audio, sampleRate: sampleRate)
+        let tempo = estimated > 30 ? estimated : 120
+        let det = OnsetDetector.detect(audio, sampleRate: sampleRate, lowHz: 40, highHz: 8000)
+        return (tempo, OnsetDetector.beatOffset(det, bpm: tempo))
+    }
+
+    private func analyzeRhythm(_ x: [Float], rhythmURL: URL?, tempoHint: Double?,
+                               progress: @escaping (String, Double) -> Void) -> MelodyTrack {
         progress("Detecting strums", 0.3)
         let det = OnsetDetector.detect(x, sampleRate: sampleRate, lowHz: 150, highHz: 6000)
         progress("Finding the beat", 0.7)
-        let bpm = ChordAnalyzer.estimateTempo(x, sampleRate: sampleRate)
-        let tempo = bpm > 30 ? bpm : 120
-        let grid = RhythmGrid(bpm: tempo, offset: OnsetDetector.beatOffset(det, bpm: tempo))
+        let (tempo, offset) = beatGrid(fallback: x, rhythmURL: rhythmURL, tempoHint: tempoHint)
+        let grid = RhythmGrid(bpm: tempo, offset: offset)
 
         let hits = det.onsets.filter { $0.strength > 0.15 }
         let steps = hits.map { Int(grid.stepPosition($0.time).rounded()) }

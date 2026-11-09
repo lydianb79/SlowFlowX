@@ -24,6 +24,15 @@ struct ToolStatus {
     var ytdlp: URL?
     var ffmpeg: URL?
     var demucs: URL?
+    /// nil = not checked yet / checking, true = self-test passed, false = broken or missing
+    var demucsOK: Bool?
+    var demucsProblem: String?
+
+    /// Demucs is installed AND its self-test passed.
+    var demucsReady: Bool { demucs != nil && demucsOK == true }
+    /// The launcher exists but Demucs can't run (e.g. a missing Python module).
+    var demucsBroken: Bool { demucs != nil && demucsOK == false }
+    var demucsChecking: Bool { demucs != nil && demucsOK == nil }
 }
 
 @MainActor
@@ -45,6 +54,11 @@ final class AppModel {
     /// Stem-separation progress keyed by song id.
     var stemStatus: [String: AnalysisStatus] = [:]
     /// Play separated stems (when available) instead of the original mix.
+    /// Demucs installer state
+    var showDemucsInstaller = false
+    private(set) var demucsInstalling = false
+    private(set) var demucsInstallLog = ""
+    private(set) var demucsInstallError: String?
     private(set) var playStems: Bool = UserDefaults.standard.object(forKey: "playStems") as? Bool ?? true
 
     @ObservationIgnored let player = PlaybackEngine()
@@ -66,9 +80,26 @@ final class AppModel {
 
     var transpose: Int { player.pitchSemitones }
 
-    func refreshTools() {
-        tools = ToolStatus(ytdlp: ToolLocator.find("yt-dlp"), ffmpeg: ToolLocator.find("ffmpeg"),
-                           demucs: ToolLocator.find("demucs"))
+    /// Re-locates the command-line tools. Demucs is also self-tested (in the background) the first time,
+    /// whenever its location changes, or when `recheckDemucs` is true.
+    func refreshTools(recheckDemucs: Bool = false) {
+        let demucs = ToolLocator.find("demucs")
+        let needsCheck = recheckDemucs || demucs != tools.demucs || tools.demucsOK == nil
+        var t = ToolStatus(ytdlp: ToolLocator.find("yt-dlp"), ffmpeg: ToolLocator.find("ffmpeg"), demucs: demucs)
+        if demucs == nil {
+            t.demucsOK = false
+        } else if !needsCheck {
+            t.demucsOK = tools.demucsOK
+            t.demucsProblem = tools.demucsProblem
+        }
+        tools = t
+        guard demucs != nil, needsCheck else { return }
+        Task {
+            let result = await StemSeparator.checkDemucs()
+            guard tools.demucs == demucs else { return }
+            tools.demucsOK = result.ok
+            tools.demucsProblem = result.ok ? nil : result.message
+        }
     }
 
     // MARK: Selection
@@ -236,10 +267,15 @@ final class AppModel {
         let url = stemKind.flatMap { song.stems?.url($0, songID: id) }
             .flatMap { FileManager.default.fileExists(atPath: $0.path) ? $0 : nil } ?? song.audioURL
         let usedStem = url == song.audioURL ? nil : stemKind?.rawValue
+        // Beat grid reference: drums stem if available, otherwise the full mix (never an isolated
+        // vocal/guitar stem, which has no reliable pulse).
+        let rhythmURL = song.stems?.url(.drums, songID: id)
+            .flatMap { FileManager.default.fileExists(atPath: $0.path) ? $0 : nil } ?? song.audioURL
+        let tempoHint = song.analysis?.bpm
         Task {
             do {
                 var track = try await Task.detached(priority: .userInitiated) {
-                    try MelodyAnalyzer().analyze(url: url, source: source) { stage, p in
+                    try MelodyAnalyzer().analyze(url: url, source: source, rhythmURL: rhythmURL, tempoHint: tempoHint) { stage, p in
                         Task { @MainActor in
                             if self.melodyStatus[key] != nil {
                                 self.melodyStatus[key] = AnalysisStatus(stage: stage, progress: p)
@@ -248,6 +284,7 @@ final class AppModel {
                     }
                 }.value
                 track.stemUsed = usedStem
+                track.version = MelodyTrack.currentVersion
                 update(id) { song in
                     var m = song.melodies ?? [:]
                     m[source.rawValue] = track
@@ -287,29 +324,80 @@ final class AppModel {
                                      resolution: Self.quantizeResolution)
     }
 
-    /// Grid snapping chosen in the Tab & Notes panel: 0 = off, 1 = 16ths, 2 = 8ths.
-    static var quantizeResolution: Int { UserDefaults.standard.integer(forKey: "melodyQuantize") }
+    /// Exports place notes on the 16th-note grid, like the sheet-style tab view.
+    static var quantizeResolution: Int { 1 }
 
     /// Adjust the detected tempo of a part (e.g. halve or double when the guess is off).
+    /// Tempo is a property of the song: changing it updates the song and every transcribed part.
     func setMelodyTempo(_ id: String, source: MelodySource, bpm: Double) {
+        setSongTempo(id, bpm: bpm, offset: nil)
+    }
+
+    func setSongTempo(_ id: String, bpm: Double, offset: Double?, userSet: Bool = true) {
         let clamped = min(max(bpm, 40), 240)
         update(id) { song in
-            guard var t = song.melodies?[source.rawValue] else { return }
-            t.bpm = clamped
-            song.melodies?[source.rawValue] = t
+            if var a = song.analysis {
+                a.bpm = clamped
+                if userSet { a.tempoLocked = true }
+                a.beatOffset = offset ?? a.beatOffset
+                song.analysis = a
+            }
+            guard var m = song.melodies else { return }
+            for k in Array(m.keys) {
+                guard var t = m[k] else { continue }
+                if t.isOutdated { t.version = MelodyTrack.currentVersion }
+                t.bpm = clamped
+                if let offset { t.beatOffset = offset } else if t.beatOffset == nil { t.beatOffset = 0 }
+                m[k] = t
+            }
+            song.melodies = m
         }
     }
 
-    /// Move the beat grid so the beat falls at `time`.
+    /// Move the beat grid (all parts) so a beat falls at `time`.
     func alignBeat(_ id: String, source: MelodySource, at time: Double) {
-        update(id) { song in
-            guard var t = song.melodies?[source.rawValue] else { return }
-            let grid = t.grid(fallbackBPM: song.analysis?.bpm ?? 0)
-            var off = time.truncatingRemainder(dividingBy: grid.beat)
-            if off < 0 { off += grid.beat }
-            t.beatOffset = off
-            song.melodies?[source.rawValue] = t
+        guard let song = songs.first(where: { $0.id == id }) else { return }
+        let bpm = song.melodies?[source.rawValue]?.grid(fallbackBPM: song.analysis?.bpm ?? 0).bpm
+            ?? song.analysis?.bpm ?? 120
+        let beat = 60 / bpm
+        var off = time.truncatingRemainder(dividingBy: beat)
+        if off < 0 { off += beat }
+        setSongTempo(id, bpm: bpm, offset: off)
+    }
+
+    // MARK: Tap tempo
+
+    @ObservationIgnored private var tapTimes: [Double] = []
+    @ObservationIgnored private var tapWall: [Date] = []
+    private(set) var tapCount = 0
+
+    /// Tap along with the beat while the song plays (works at any playback speed — taps are
+    /// measured in song time). After 4+ taps the song tempo and beat position are set.
+    func tapTempo(_ id: String) {
+        let now = Date()
+        if let last = tapWall.last, now.timeIntervalSince(last) > 2.5 {
+            tapTimes.removeAll(); tapWall.removeAll()
         }
+        tapTimes.append(player.currentTime)
+        tapWall.append(now)
+        if tapTimes.count > 16 { tapTimes.removeFirst(); tapWall.removeFirst() }
+        tapCount = tapTimes.count
+        guard tapTimes.count >= 4 else { return }
+        let intervals = zip(tapTimes.dropFirst(), tapTimes).map { $0 - $1 }.filter { $0 > 0.2 && $0 < 2 }
+        guard intervals.count >= 3 else { return }
+        let sorted = intervals.sorted()
+        let beat = sorted[sorted.count / 2]
+        let bpm = (60 / beat * 2).rounded() / 2          // nearest 0.5 BPM
+        let b = 60 / bpm
+        // circular mean of tap phases → beat offset
+        var sx = 0.0, sy = 0.0
+        for t in tapTimes {
+            let ph = t.truncatingRemainder(dividingBy: b) / b * 2 * .pi
+            sx += cos(ph); sy += sin(ph)
+        }
+        var phase = atan2(sy, sx) / (2 * .pi) * b
+        if phase < 0 { phase += b }
+        setSongTempo(id, bpm: bpm, offset: phase)
     }
 
     func copyASCIITab(_ id: String, source: MelodySource) {
@@ -337,9 +425,10 @@ final class AppModel {
 
     func separateStems(_ id: String, engine: StemEngine) {
         guard let song = songs.first(where: { $0.id == id }), stemStatus[id] == nil else { return }
-        refreshTools()
-        if engine == .demucs && tools.demucs == nil {
-            show("Demucs not installed", StemError.demucsMissing.errorDescription ?? "")
+        if engine == .demucs && !tools.demucsReady {
+            // Missing, broken or still being checked: open the installer, which can repair it.
+            showDemucsInstaller = true
+            if tools.demucsChecking { refreshTools(recheckDemucs: true) }
             return
         }
         stemStatus[id] = AnalysisStatus(stage: engine == .demucs ? "Starting Demucs…" : "Separating", progress: 0)
@@ -370,16 +459,68 @@ final class AppModel {
                 }
                 try Task.checkCancellation()
                 update(id) { $0.stems = set }
+                retempoFromDrums(id)
                 if selectedID == id, playStems, let s = songs.first(where: { $0.id == id }) { loadStemsIntoPlayer(s) }
             } catch is CancellationError {
                 // cancelled by the user
             } catch {
-                show("Stem separation failed", error.localizedDescription)
+                if engine == .demucs {
+                    // Re-test Demucs; if it's broken the Stems bar switches to "Repair Demucs".
+                    tools.demucsOK = nil
+                    refreshTools(recheckDemucs: true)
+                    show("Stem separation failed",
+                         error.localizedDescription + "\n\nIf Demucs itself is broken, use “Repair Demucs” in the Stems bar (or Settings › Tools).")
+                } else {
+                    show("Stem separation failed", error.localizedDescription)
+                }
             }
             stemStatus[id] = nil
             stemTasks[id] = nil
         }
         stemTasks[id] = task
+    }
+
+    func installDemucs() {
+        guard !demucsInstalling else { return }
+        demucsInstalling = true
+        demucsInstallError = nil
+        demucsInstallLog = ""
+        Task {
+            do {
+                try await StemSeparator.installDemucs { line in
+                    Task { @MainActor in
+                        self.demucsInstallLog += line + "\n"
+                        if self.demucsInstallLog.count > 60_000 {
+                            self.demucsInstallLog = String(self.demucsInstallLog.suffix(40_000))
+                        }
+                    }
+                }
+            } catch {
+                demucsInstallError = error.localizedDescription
+            }
+            tools.demucsOK = nil
+            refreshTools(recheckDemucs: true)
+            demucsInstalling = false
+        }
+    }
+
+    /// The drums stem gives a much cleaner pulse than the full mix: re-detect tempo and bar position
+    /// from it (unless the user already set the tempo by hand).
+    func retempoFromDrums(_ id: String, force: Bool = false) {
+        guard let song = songs.first(where: { $0.id == id }),
+              force || song.analysis?.tempoLocked != true,
+              let drums = song.stems?.url(.drums, songID: id),
+              FileManager.default.fileExists(atPath: drums.path) else { return }
+        Task {
+            let result = await Task.detached(priority: .utility) { () -> (Double, Double)? in
+                guard let x = try? AudioLoader.loadMono(url: drums, sampleRate: 22_050) else { return nil }
+                let det = OnsetDetector.detect(x, sampleRate: 22_050, lowHz: 40, highHz: 10_000)
+                let bpm = ChordAnalyzer.tempo(fromFlux: det.flux, frameRate: det.frameRate)
+                guard bpm > 30 else { return nil }
+                return (bpm, OnsetDetector.beatOffset(det, bpm: bpm))
+            }.value
+            if let r = result { setSongTempo(id, bpm: r.0, offset: r.1, userSet: force) }
+        }
     }
 
     func cancelStemSeparation(_ id: String) {

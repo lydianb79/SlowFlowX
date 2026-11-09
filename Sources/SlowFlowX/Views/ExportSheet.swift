@@ -88,13 +88,15 @@ struct ExportSheet: View {
                                     Label("Separate with Demucs (AI)", systemImage: "wand.and.stars")
                                 }
                                 .buttonStyle(PrimaryButtonStyle())
-                                .disabled(model.tools.demucs == nil)
-                                .help(model.tools.demucs == nil ? "Install Demucs first (Settings › Tools)" : "High-quality separation")
+                                .disabled(!model.tools.demucsReady)
+                                .help(!model.tools.demucsReady ? "Install or repair Demucs first (Settings › Tools)" : "High-quality separation")
                                 Button("Quick (built-in)") { model.separateStems(song.id, engine: .builtin) }
                                     .buttonStyle(GhostButtonStyle())
                             }
-                            if model.tools.demucs == nil {
-                                Text("Demucs isn't installed — see Settings › Tools, or use the quick built-in separator.")
+                            if !model.tools.demucsReady {
+                                Text(model.tools.demucsBroken
+                                     ? "Demucs is installed but not working — repair it in Settings › Tools, or use the quick built-in separator."
+                                     : "Demucs isn't installed — see Settings › Tools, or use the quick built-in separator.")
                                     .font(.system(size: 10.5))
                                     .foregroundStyle(theme.subtextColor)
                             }

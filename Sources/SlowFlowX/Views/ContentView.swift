@@ -21,6 +21,9 @@ struct ContentView: View {
             }
         }
         .toolbarBackground(theme.background, for: .windowToolbar)
+        .sheet(isPresented: $model.showDemucsInstaller) {
+            InstallDemucsSheet()
+        }
         .alert(item: $model.alert) { a in
             Alert(title: Text(a.title), message: Text(a.message), dismissButton: .default(Text("OK")))
         }

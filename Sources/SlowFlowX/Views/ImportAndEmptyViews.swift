@@ -152,13 +152,35 @@ struct ToolsStatusCard: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             SectionHeader(title: "Requirements", icon: "wrench.and.screwdriver") {
-                Button("Re-check") { model.refreshTools() }
+                Button("Re-check") { model.refreshTools(recheckDemucs: true) }
                     .buttonStyle(GhostButtonStyle())
             }
             row(name: "yt-dlp", detail: "downloads audio from YouTube (required)", path: model.tools.ytdlp)
             row(name: "ffmpeg", detail: "converts any stream to M4A (recommended)", path: model.tools.ffmpeg)
-            row(name: "demucs", detail: "AI stem separation (optional, recommended)", path: model.tools.demucs)
-            if model.tools.demucs == nil {
+            row(name: "demucs", detail: model.tools.demucsBroken ? "installed but NOT working — repair below"
+                : (model.tools.demucsChecking ? "checking…" : "AI stem separation (optional, recommended)"),
+                path: model.tools.demucsReady || model.tools.demucsChecking ? model.tools.demucs : nil)
+            if let problem = model.tools.demucsProblem, model.tools.demucsBroken {
+                Text(problem)
+                    .font(.system(size: 11, design: .monospaced))
+                    .foregroundStyle(.orange)
+                    .lineLimit(2)
+            }
+            if !model.tools.demucsReady && !model.tools.demucsChecking {
+                HStack {
+                    Text(model.tools.demucsBroken ? "Demucs needs repairing. SlowFlowX can fix it for you."
+                         : "Demucs gives clean AI stems. SlowFlowX can install it for you.")
+                        .font(.system(size: 12))
+                        .foregroundStyle(theme.textColor)
+                    Spacer()
+                    Button {
+                        model.showDemucsInstaller = true
+                    } label: {
+                        Label(model.demucsInstalling ? "Installing…" : (model.tools.demucsBroken ? "Repair Demucs…" : "Install Demucs…"),
+                              systemImage: "arrow.down.circle")
+                    }
+                    .buttonStyle(PrimaryButtonStyle())
+                }
                 HStack {
                     Text(StemSeparator.installCommand)
                         .font(.system(size: 12, design: .monospaced))

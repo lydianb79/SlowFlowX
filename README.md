@@ -32,12 +32,13 @@ SlowFlowX downloads the audio of a song and detects its chords on the GPU with *
   - Guitar uses open shapes where they exist and E- or A-shape barre chords for everything else.
   - Root notes are highlighted.
 - **Chords in this song**: a strip showing every chord the song uses, with its shape.
-- A **chord grid** you can click to jump to a chord. Right-click a chord to loop it.
+- A **progression row** that slides to keep the current chord centred. Click a chord to jump to it, or right-click it to loop it.
 
 ### Stem separation
 - **Split any song into stems**: vocals, drums, bass, guitar, piano and other.
   - **Demucs (AI, recommended)**: Meta AI Research's open-source separator runs locally and uses the GPU (MPS) on Apple Silicon. You can choose between a 6-stem, a 4-stem or a fine-tuned 4-stem model in Settings › Stems.
-  - **Built-in (quick)**: no extra software is needed. It separates the stereo centre and splits sustained sounds from drum hits, using a **Metal median-filter kernel**. You get 4 stems at lower quality.
+  - **One-click install and repair**: if Demucs is missing, **Install Demucs** in the Stems bar (or Settings › Tools) runs Homebrew → uv → Demucs on Python 3.12 with torch 2.8 for you and shows the log. SlowFlowX also self-tests Demucs (it imports everything a separation needs), so a broken install shows **Repair Demucs** instead of failing silently.
+  - **Built-in (quick)**: no extra software is needed, but it is only a rough split, because vocals, kick, snare and bass usually all sit in the stereo centre. Stems made this way are marked "Quick stems", with a one-click **Redo with Demucs**. It separates the stereo centre and makes a three-way split of steady tones, drum hits and the remainder (vibrato vocals), using a **Metal median-filter kernel**. You get 4 stems.
 - **Stem mixer** under the waveform: mute, solo or set the volume of each stem while playing.
   - All stems stay sample-locked, and speed, transpose and loops still apply.
   - Right-click a stem for **Solo only** or **Everything except** (a karaoke or play-along backing track).
@@ -49,19 +50,23 @@ SlowFlowX downloads the audio of a song and detects its chords on the GPU with *
   - A **Viterbi pitch tracker** detects where the part is playing and keeps glides and vibrato smooth.
   - Semitone **note segmentation** turns the pitch line into separate notes.
   - **Accurate note lengths**: an attack detector splits repeated notes (e.g. chugging riffs) into separate hits and snaps each note to its attack. For guitar and bass, notes end when the pitch dies away rather than when it disappears completely.
-  - **Tempo and beat position** are found for every part, so bar lines and the 16th grid line up with the music.
+  - **Octave slips** (short notes an octave away from both neighbours) are corrected.
 - **Rhythm guitar**: strums are detected from attacks and labelled **↓ down / ↑ up**. Down falls on the beat, up between beats. If a fair share of strums land on in-between 16ths, the pattern is treated as 16th-note strumming. Each strum shows the chord shape from the chord analysis, in the tab and in the piano roll.
-- **Rhythm notation** under the tab: stems, flags, dots, and beams grouped per beat.
-- **Grid snapping**: show notes as played (Off), or snapped to 1/8 or 1/16 notes. Exports use the same setting.
-- **Tempo controls**: ½× / 2× / ±1 BPM when the tempo guess is off. **Beat Here** moves the grid so a beat falls at the playhead.
-- **Guitar / bass tab** that scrolls with the music:
-  - Frets are chosen by an optimiser that keeps hand movement small (standard EADGBE tuning, or EADG for bass).
-  - Notes outside the instrument's range are moved by an octave and marked 8va/8vb.
-  - Chord names and beat and bar lines are shown above the tab.
+- **Guitar / bass tab in a printed-sheet layout**:
+  - Several bars per line, depending on window width, with lines stacked. The current bar is highlighted and the page turns as the song plays.
+  - Notes sit on a 16th-note grid with **rhythm notation** underneath (stems, flags, dots, beams per beat). Chord names, bar numbers and beat ticks are shown, plus ↓/↑ strum arrows for the rhythm part.
+  - **Realistic fingering**: the fretting hand sits in a four-fret position (index finger at fret 12 or below) and only moves when it must, so passages stay compact and the same note keeps the same fret. Standard EADGBE tuning, or EADG for bass. Notes outside the range are moved by an octave and marked 8va/8vb.
+  - Click anywhere in the tab to jump there.
+- **Tempo and bars** (one tempo per song, shared by all parts):
+  - Detected with an onset-envelope autocorrelation that weighs several metrical levels. After stem separation it is **re-detected from the drums stem**, together with the bar position. The beat grid for transcriptions also comes from the drums stem or the full mix, never from an isolated vocal or guitar stem.
+  - A **beat light** (four dots, bright on beat 1) shows at a glance whether the tempo and bar lines are right.
+  - **Tempo menu**: ½× / ⅔× / 1.5× / 2× related tempos, ±1 BPM, and **Detect from Drums Stem**.
+  - **Tap tempo**: tap along on the beat while the song plays (this works at slowed-down speeds too). **Beat Here** puts beat 1 at the playhead.
+  - A tempo you set yourself is never overwritten automatically.
 - **Piano roll** with a keyboard whose keys light up as each note plays, plus note names on the bars.
 - A **current / next notes** display, with the current lyric line underneath.
 - Drag to scrub and click to jump. Speed, looping and transpose all apply (transposing re-fingers the tab).
-- **Export MIDI** (open it in GarageBand, Logic or MuseScore to see sheet music; the first beat is aligned to the bar), or **copy / save a plain-text tab** with a rhythm line and down/up strum markers.
+- **Export MIDI** (open it in GarageBand, Logic or MuseScore to see sheet music; notes are on the 16th grid and the first beat is aligned to the bar), or **copy / save a plain-text tab** with a rhythm line and down/up strum markers.
 - Transcription is automatic and approximate. It works best when the part stands out in the mix.
 
 ### Lyrics
@@ -109,21 +114,41 @@ brew install yt-dlp ffmpeg
 
 ```bash
 brew install uv
-uv tool install --python 3.12 demucs --with "torch==2.8.*" --with "torchaudio==2.8.*"
+uv tool install --force --python 3.12 demucs --with "torch==2.8.*" --with "torchaudio==2.8.*" --with numpy --with soundfile
 ```
 
-  Use Python 3.12, because some dependencies have no builds for the newest Python yet. Pin torch and torchaudio to 2.8, because torchaudio 2.9+ saves audio through TorchCodec, which breaks Demucs' output. With pipx instead: `pipx install --python python3.12 demucs && pipx inject demucs "torch==2.8.*" "torchaudio==2.8.*"`.
+  Use Python 3.12, because some dependencies have no builds for the newest Python yet. Pin torch and torchaudio to 2.8, because torchaudio 2.9+ saves audio through TorchCodec, which breaks Demucs' output. Add `numpy` and `soundfile` explicitly: Demucs needs both but doesn't declare them. With pipx instead: `pipx install --python python3.12 demucs && pipx inject demucs "torch==2.8.*" "torchaudio==2.8.*" numpy soundfile`.
 
 ## Build & run
+
+The build script produces **two separate apps**, one for Apple Silicon and one for Intel Macs, each with a ready-to-share zip:
 
 ```bash
 git clone https://github.com/lydianb79/SlowFlowX.git
 cd SlowFlowX
-./Scripts/build_app.sh                    # → build/SlowFlowX.app (release)
-open build/SlowFlowX.app
-
-./Scripts/build_app.sh release --install  # also copies it to /Applications
+./Scripts/build_app.sh                         # release build of both architectures
+open build/arm64/SlowFlowX.app                 # Apple Silicon (M1/M2/M3/M4…)
+open build/x86_64/SlowFlowX.app                # Intel Macs
 ```
+
+| Output | For |
+|---|---|
+| `build/arm64/SlowFlowX.app`, `build/SlowFlowX-1.0-arm64.zip` | Apple Silicon Macs |
+| `build/x86_64/SlowFlowX.app`, `build/SlowFlowX-1.0-x86_64.zip` | Intel Macs |
+
+More options:
+
+```bash
+./Scripts/build_app.sh release arm64           # only one architecture (arm64 | x86_64 | all)
+./Scripts/build_app.sh debug                   # debug builds
+./Scripts/build_app.sh release all --install   # also copy the app for this Mac to /Applications
+```
+
+The script quits a running SlowFlowX first, so `open` always launches the fresh build. Each binary is checked with `lipo` to confirm it is built for the right architecture.
+
+Notes:
+- Both apps are signed ad-hoc. On another Mac, right-click the app and choose **Open** the first time, or clear the quarantine flag with `xattr -dr com.apple.quarantine SlowFlowX.app`.
+- Stem separation with Demucs uses the GPU (MPS) on Apple Silicon. On Intel it runs on the CPU, which is noticeably slower.
 
 To work in Xcode, open `Package.swift` and run the **SlowFlowX** scheme. Use the `.app` from the build script for speech transcription, because that feature needs the permission string in `Info.plist`.
 
@@ -174,8 +199,11 @@ Your library (audio, stems and analysis) is stored in `~/Library/Application Sup
 - **Downloads fail**: YouTube has probably changed something. Run `brew upgrade yt-dlp`.
 - **"yt-dlp was not found"**: install it with Homebrew, then click *Re-check* on the start screen or in Settings › Tools.
 - **No lyrics found**: use the 🔍 button in the Lyrics panel to search by exact artist and title, or transcribe from the audio.
-- **Bars or note lengths look shifted**: use ½× / 2× if the tempo is off. Then pause on a clear downbeat and press **Beat Here**. Parts transcribed with an older version show an **Update Transcription** button.
+- **Bars or note lengths look shifted**: watch the beat light. If it runs at half or double speed, pick the related tempo in the tempo menu, or use **Detect from Drums Stem** or **Tap**. If the beat is right but beat 1 is wrong, pause on a downbeat and press **Beat Here**. Parts transcribed with an older version show an **Update Transcription** button.
+- **The app still looks like the old version after building**: the script quits a running SlowFlowX, but if you launched a copy from /Applications, quit it (⌘Q) and open the one in `build/<arch>/`.
+- **"No module named 'numpy'"** (or 'soundfile'): reinstall with the command above, which adds both.
 - **Demucs won't install** (Rust / PyO3 / "Python version is newer than … supported"): install with Python 3.12 as shown under Requirements.
+- **Demucs installed but separation fails**: use **Repair Demucs** (Stems bar or Settings › Tools).
 - **Demucs fails or is slow**: make sure `demucs` runs in Terminal (`demucs --help`). A TorchCodec error means torchaudio is too new, so reinstall with the 2.8 pins. The first run downloads the model. If the GPU fails, SlowFlowX retries on the CPU, which is slower. The built-in separator always works.
 - **Messy tab / notes**: separate the stems first, then use **Transcribe from Stem**. try another part (Vocal, Lead or Bass). Transcription follows whichever part is loudest in its range, so busy mixes produce stray notes. Slowing down doesn't affect the transcription, but it makes checking by ear much easier.
 - **Wrong chords**: automatic recognition is an estimate. It is very good for practice charts, but dense mixes, heavy distortion or jazz voicings will cause errors. Use the chord grid together with your ears.

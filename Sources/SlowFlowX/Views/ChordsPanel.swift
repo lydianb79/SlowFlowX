@@ -34,21 +34,14 @@ struct ChordsPanel: View {
                 let idx = analysis.chordIndex(at: player.currentTime)
                 NowChordView(analysis: analysis, index: idx, time: player.currentTime,
                              transpose: transpose, rate: Double(player.rate), style: style)
-                // Everything below the current chord scrolls, so the panel can shrink on small windows.
-                ScrollViewReader { proxy in
-                    ScrollView {
-                        VStack(alignment: .leading, spacing: 12) {
-                            SongChordsStrip(analysis: analysis, currentIndex: idx, transpose: transpose, style: style)
-                            SpectrumMetalViewContainer(isActive: player.isPlaying)
-                                .frame(height: 40)
-                            ChordSheetGrid(chords: analysis.chords, currentIndex: idx, transpose: transpose,
-                                           proxy: proxy,
-                                           onSeek: { player.seek(to: $0.start) },
-                                           onLoop: { player.setLoop(start: $0.start, end: $0.end) })
-                        }
-                    }
-                }
-                .frame(minHeight: 0, maxHeight: .infinity)
+                // Progression row: one line of chords that slides to keep the current one centred.
+                ChordProgressionRow(chords: analysis.chords, currentIndex: idx, transpose: transpose,
+                                    onSeek: { player.seek(to: $0.start) },
+                                    onLoop: { player.setLoop(start: $0.start, end: $0.end) })
+                    .frame(height: 64)
+                SongChordsStrip(analysis: analysis, currentIndex: idx, transpose: transpose, style: style)
+                SpectrumMetalViewContainer(isActive: player.isPlaying)
+                    .frame(minHeight: 18, maxHeight: 60)
             } else if model.analysisStatus[song.id] != nil {
                 Spacer()
                 HStack { Spacer(); ProgressView("Detecting chords…"); Spacer() }
@@ -199,33 +192,46 @@ struct PianoView: View {
     }
 }
 
-// MARK: - Chord sheet grid
+// MARK: - Chord progression row
 
-private struct ChordSheetGrid: View {
+private struct ChordProgressionRow: View {
     @Environment(\.appTheme) private var theme
     let chords: [ChordSegment]
     let currentIndex: Int?
     let transpose: Int
-    let proxy: ScrollViewProxy
     let onSeek: (ChordSegment) -> Void
     let onLoop: (ChordSegment) -> Void
 
     var body: some View {
-        LazyVGrid(columns: [GridItem(.adaptive(minimum: 74), spacing: 8)], spacing: 8) {
-            ForEach(Array(chords.enumerated()), id: \.offset) { i, seg in
-                ChordCell(segment: seg, isCurrent: i == currentIndex, transpose: transpose)
-                    .id(i)
-                    .onTapGesture { onSeek(seg) }
-                    .contextMenu {
-                        Button("Play from Here") { onSeek(seg) }
-                        Button("Loop This Chord") { onLoop(seg) }
+        ScrollViewReader { proxy in
+            ScrollView(.horizontal, showsIndicators: false) {
+                LazyHStack(spacing: 8) {
+                    ForEach(Array(chords.enumerated()), id: \.offset) { i, seg in
+                        ChordCell(segment: seg, isCurrent: i == currentIndex, transpose: transpose)
+                            .frame(width: 74)
+                            .id(i)
+                            .onTapGesture { onSeek(seg) }
+                            .contextMenu {
+                                Button("Play from Here") { onSeek(seg) }
+                                Button("Loop This Chord") { onLoop(seg) }
+                            }
                     }
+                }
+                .padding(.horizontal, 4)
+                .padding(.vertical, 4)
             }
-        }
-        .padding(2)
-        .onChange(of: currentIndex) { _, newValue in
-            guard let newValue else { return }
-            withAnimation(.easeInOut(duration: 0.3)) { proxy.scrollTo(newValue, anchor: .center) }
+            .mask(
+                LinearGradient(stops: [.init(color: .clear, location: 0), .init(color: .black, location: 0.05),
+                                       .init(color: .black, location: 0.95), .init(color: .clear, location: 1)],
+                               startPoint: .leading, endPoint: .trailing)
+            )
+            .onChange(of: currentIndex) { _, newValue in
+                guard let newValue else { return }
+                withAnimation(.easeInOut(duration: 0.3)) { proxy.scrollTo(newValue, anchor: .center) }
+            }
+            .onAppear {
+                if let currentIndex { proxy.scrollTo(currentIndex, anchor: .center) }
+            }
         }
     }
 }

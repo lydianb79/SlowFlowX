@@ -99,6 +99,10 @@ struct MelodyTrack: Codable, Hashable {
     var strums: [Strum]? = nil
     /// Stem the part was transcribed from (nil = full mix).
     var stemUsed: String? = nil
+    /// Transcription algorithm version (older tracks offer "Update Transcription").
+    var version: Int? = nil
+    static let currentVersion = 3
+    var isOutdated: Bool { (version ?? 0) < Self.currentVersion }
 
     var isEmpty: Bool { source.isRhythm ? (strums ?? []).isEmpty : notes.isEmpty }
     var eventCount: Int { source.isRhythm ? (strums ?? []).count : notes.count }
@@ -125,9 +129,12 @@ struct MelodyTrack: Codable, Hashable {
     }
 
     func grid(fallbackBPM: Double) -> RhythmGrid {
-        let own = bpm ?? 0
+        // Tracks from older versions measured tempo on the isolated stem, which is unreliable:
+        // use the song's tempo for them until they are transcribed again.
+        let trusted = !isOutdated
+        let own = trusted ? (bpm ?? 0) : 0
         let b = own > 30 ? own : (fallbackBPM > 30 ? fallbackBPM : 120)
-        return RhythmGrid(bpm: b, offset: beatOffset ?? 0)
+        return RhythmGrid(bpm: b, offset: trusted ? (beatOffset ?? 0) : 0)
     }
 
     /// Notes to display for this part. For the rhythm part these are the chord tones of each strum.
@@ -263,11 +270,15 @@ struct TabPosition: Hashable {
 }
 
 enum TabFingering {
-    /// Chooses a string/fret for every note, minimising hand movement (dynamic programming).
+    /// Chooses a string/fret for every note the way a player would: the fretting hand sits in a
+    /// position (index finger on fret P, covering frets P…P+3) and only moves when it has to.
+    /// A dynamic-programming pass picks the sequence of hand positions with the least movement,
+    /// then each note is placed inside its position, preferring small string changes.
     static func positions(for notes: [MelodyNote], instrument: TabInstrument, transpose: Int) -> [TabPosition] {
         guard !notes.isEmpty else { return [] }
         let tuning = instrument.tuning
 
+        // Candidate (string, fret) pairs per note, after folding into the instrument's range.
         var candidates: [[TabPosition]] = []
         for n in notes {
             var midi = n.midi + transpose
@@ -283,40 +294,72 @@ enum TabFingering {
             candidates.append(c)
         }
 
-        func positionCost(_ p: TabPosition) -> Double {
-            (p.fret > 12 ? Double(p.fret - 12) * 0.35 : 0) + Double(p.fret) * 0.04
+        let positions = Array(1...12)          // index-finger fret (keeps the hand below the 15th fret)
+        let P = positions.count
+
+        /// Cost of playing candidate `c` while the hand is at position `pos` (∞ if unreachable).
+        func reach(_ c: TabPosition, _ pos: Int) -> Double {
+            if c.fret == 0 { return 0.35 }                         // open strings work from anywhere
+            if c.fret >= pos && c.fret <= pos + 3 { return 0 }     // inside the hand
+            if c.fret == pos - 1 || c.fret == pos + 4 { return 1.0 } // small stretch
+            return .infinity
         }
-        func moveCost(_ a: TabPosition, _ b: TabPosition, gap: Double) -> Double {
-            let fretMove: Double = (a.fret == 0 || b.fret == 0) ? 1.0 : Double(abs(b.fret - a.fret))
-            let stringMove = Double(abs(b.string - a.string)) * 0.25
-            let span = (abs(b.fret - a.fret) > 4 && a.fret > 0 && b.fret > 0) ? 2.0 : 0
-            let relax = gap > 1.2 ? 0.3 : 1.0
-            return (fretMove + stringMove + span) * relax
+        func bestReach(_ i: Int, _ pos: Int) -> Double {
+            candidates[i].map { reach($0, pos) }.min() ?? .infinity
         }
 
-        var cost = candidates[0].map(positionCost)
-        var back: [[Int]] = [Array(repeating: 0, count: candidates[0].count)]
-        for i in 1..<candidates.count {
+        // DP over hand positions.
+        /// Players prefer the lower half of the neck; high positions get progressively more expensive.
+        func positionCost(_ pos: Int) -> Double { Double(pos) * 0.08 + Double(max(0, pos - 7)) * 0.25 }
+
+        var cost = positions.map { bestReach(0, $0) + positionCost($0) }
+        var back: [[Int]] = [Array(repeating: 0, count: P)]
+        for i in 1..<notes.count {
             let gap = notes[i].start - notes[i - 1].end
-            var newCost: [Double] = []
-            var choice: [Int] = []
-            for b in candidates[i] {
-                var best = Double.greatestFiniteMagnitude, bestJ = 0
-                for (j, a) in candidates[i - 1].enumerated() {
-                    let v = cost[j] + moveCost(a, b, gap: gap)
-                    if v < best { best = v; bestJ = j }
+            let relax = gap > 1.0 ? 0.35 : 1.0      // rests make shifting easy
+            var newCost = [Double](repeating: .infinity, count: P)
+            var choice = [Int](repeating: 0, count: P)
+            for (pi, pos) in positions.enumerated() {
+                let r = bestReach(i, pos)
+                guard r.isFinite else { continue }
+                var best = Double.infinity, bestJ = 0
+                for (pj, prev) in positions.enumerated() where cost[pj].isFinite {
+                    let move = prev == pos ? 0 : (1.5 + 0.3 * Double(abs(pos - prev))) * relax
+                    let v = cost[pj] + move
+                    if v < best { best = v; bestJ = pj }
                 }
-                newCost.append(best + positionCost(b))
-                choice.append(bestJ)
+                newCost[pi] = best + r + positionCost(pos)
+                choice[pi] = bestJ
+            }
+            if newCost.allSatisfy({ !$0.isFinite }) {
+                // unreachable note (shouldn't happen) – restart from any position
+                newCost = positions.map { bestReach(i, $0) + positionCost($0) }
+                choice = Array(repeating: cost.indices.min { cost[$0] < cost[$1] } ?? 0, count: P)
             }
             cost = newCost
             back.append(choice)
         }
-        var idx = cost.indices.min { cost[$0] < cost[$1] } ?? 0
-        var result = [TabPosition](repeating: candidates[0][0], count: notes.count)
+
+        var pIdx = cost.indices.min { cost[$0] < cost[$1] } ?? 0
+        var handPos = [Int](repeating: 1, count: notes.count)
         for i in stride(from: notes.count - 1, through: 0, by: -1) {
-            result[i] = candidates[i][idx]
-            idx = back[i][idx]
+            handPos[i] = positions[pIdx]
+            pIdx = back[i][pIdx]
+        }
+
+        // Place each note inside its hand position, keeping string changes small.
+        var result: [TabPosition] = []
+        var prevString: Int?
+        for i in notes.indices {
+            let pos = handPos[i]
+            let best = candidates[i].min { a, b in
+                func score(_ c: TabPosition) -> Double {
+                    reach(c, pos) + (prevString.map { Double(abs(c.string - $0)) * 0.15 } ?? 0)
+                }
+                return score(a) < score(b)
+            } ?? candidates[i][0]
+            result.append(best)
+            prevString = best.string
         }
         return result
     }
