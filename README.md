@@ -166,8 +166,9 @@ The script quits a running SlowFlowX first, so `open` always launches the fresh 
 
 `.github/workflows/release.yml` builds both apps on a macOS runner:
 
-- **Push a version tag**, for example `git tag v1.1 && git push origin v1.1`. Both zips are attached to the GitHub release for that tag, and the release is created if it doesn't exist yet.
-- **Run it manually** (Actions › Build & Release › Run workflow). The zips are only uploaded as workflow artifacts.
+- **Publish a release** on GitHub, or with `gh release create v1.1`. The workflow builds both apps and attaches the zips to that release.
+- **Push a version tag**, for example `git tag v1.1 && git push origin v1.1`. Same result, and the release is created if it doesn't exist yet.
+- **Run it manually** (Actions › Build & Release › Run workflow), optionally with a tag. Without a tag, the zips are only kept as workflow artifacts.
 
 Bump `CFBundleShortVersionString` in `Resources/Info.plist` before tagging so the zip names carry the new version.
 
