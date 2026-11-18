@@ -1,0 +1,53 @@
+name: Build & Release
+
+# Builds the Apple Silicon (arm64) and Intel (x86_64) apps on a macOS runner.
+# - Push a tag like v1.0 → both zips are attached to the GitHub release for that tag
+#   (the release is created if it doesn't exist yet).
+# - Run it manually (Actions → Build & Release → Run workflow) → zips are available as
+#   workflow artifacts only.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Toolchain
+        run: |
+          xcodebuild -version
+          swift --version
+
+      - name: Build arm64 and x86_64 apps
+        run: ./Scripts/build_app.sh release all
+
+      - name: Verify architectures
+        run: |
+          lipo -archs build/arm64/SlowFlowX.app/Contents/MacOS/SlowFlowX
+          lipo -archs build/x86_64/SlowFlowX.app/Contents/MacOS/SlowFlowX
+          ls -la build/*.zip
+
+      - name: Upload workflow artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: SlowFlowX-apps
+          path: build/*.zip
+
+      - name: Attach to GitHub release
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" build/*.zip --clobber
+          else
+            gh release create "$TAG" build/*.zip --title "SlowFlowX ${TAG#v}" --generate-notes
+          fi

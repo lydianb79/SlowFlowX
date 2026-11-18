@@ -13,6 +13,22 @@
 
 SlowFlowX downloads the audio of a song and detects its chords on the GPU with **Metal**. It shows time-synced lyrics with the chords above each line, and you can practise any section at any speed, as a loop, transposed to your key.
 
+<p align="center">
+  <img src="docs/screenshot.png" alt="SlowFlowX: waveform with chord lane, stem mixer and the sheet-style tab of the vocal melody">
+</p>
+<p align="center"><sub>Waveform with chord lane, Demucs stem mixer, and the vocal melody as sheet-style guitar tab. The video thumbnail and lyric are blurred in this screenshot.</sub></p>
+
+## Download
+
+Get the latest version from the [**Releases**](https://github.com/lydianb79/SlowFlowX/releases/latest) page:
+
+| File | For |
+|---|---|
+| `SlowFlowX-<version>-arm64.zip` | Apple Silicon Macs (M1, M2, M3, M4…) |
+| `SlowFlowX-<version>-x86_64.zip` | Intel Macs |
+
+Unzip, move **SlowFlowX.app** to Applications, then **right-click → Open** the first time. The app is signed ad-hoc and not notarized, so macOS asks once. Then install the command-line tools listed under [Requirements](#requirements).
+
 ## Features
 
 ### Import
@@ -146,6 +162,15 @@ More options:
 
 The script quits a running SlowFlowX first, so `open` always launches the fresh build. Each binary is checked with `lipo` to confirm it is built for the right architecture.
 
+### Releases (GitHub Actions)
+
+`.github/workflows/release.yml` builds both apps on a macOS runner:
+
+- **Push a version tag**, for example `git tag v1.1 && git push origin v1.1`. Both zips are attached to the GitHub release for that tag, and the release is created if it doesn't exist yet.
+- **Run it manually** (Actions › Build & Release › Run workflow). The zips are only uploaded as workflow artifacts.
+
+Bump `CFBundleShortVersionString` in `Resources/Info.plist` before tagging so the zip names carry the new version.
+
 Notes:
 - Both apps are signed ad-hoc. On another Mac, right-click the app and choose **Open** the first time, or clear the quarantine flag with `xattr -dr com.apple.quarantine SlowFlowX.app`.
 - Stem separation with Demucs uses the GPU (MPS) on Apple Silicon. On Intel it runs on the CPU, which is noticeably slower.
@@ -190,6 +215,8 @@ Sources/SlowFlowX/
               lyrics, melody tab & piano roll, transport, export sheet, settings
 Resources/    Info.plist, AppIcon.icns, AppIcon.iconset, AppIcon-1024.png
 Scripts/      build_app.sh
+docs/         screenshot.png
+.github/      workflows/release.yml (builds and releases both architectures)
 ```
 
 Your library (audio, stems and analysis) is stored in `~/Library/Application Support/SlowFlowX/`.
