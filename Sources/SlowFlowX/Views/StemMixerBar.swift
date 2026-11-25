@@ -54,14 +54,17 @@ struct StemMixerBar: View {
                     Badge(text: "Demucs · \(stems.model)", tint: theme.accent2Color)
                 }
                 if player.usingStems {
-                    ScrollView(.horizontal, showsIndicators: false) {
-                        HStack(spacing: 8) {
-                            ForEach(player.stemKinds) { kind in
-                                StemChannel(kind: kind)
-                            }
+                    // Full channels when there's room, icon-only pills when it's tight, and a
+                    // visible horizontal scroller only as a last resort — never a silently clipped stem.
+                    ViewThatFits(in: .horizontal) {
+                        channels(player.stemKinds, compact: false)
+                        channels(player.stemKinds, compact: true)
+                        ScrollView(.horizontal, showsIndicators: true) {
+                            channels(player.stemKinds, compact: true)
+                                .padding(.bottom, 6)
                         }
-                        .padding(.vertical, 1)
                     }
+                    .frame(maxWidth: .infinity, alignment: .leading)
                     Button { player.resetMix() } label: { Image(systemName: "arrow.counterclockwise") }
                         .buttonStyle(GhostButtonStyle())
                         .help("Unmute all stems and reset volumes")
@@ -124,12 +127,23 @@ struct StemMixerBar: View {
         .background(RoundedRectangle(cornerRadius: 12, style: .continuous).fill(theme.surfaceColor))
         .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous).strokeBorder(theme.borderColor))
     }
+
+    private func channels(_ kinds: [StemKind], compact: Bool) -> some View {
+        HStack(spacing: compact ? 6 : 8) {
+            ForEach(kinds) { kind in
+                StemChannel(kind: kind, compact: compact)
+            }
+        }
+        .padding(.vertical, 1)
+        .fixedSize()
+    }
 }
 
 private struct StemChannel: View {
     @Environment(AppModel.self) private var model
     @Environment(\.appTheme) private var theme
     let kind: StemKind
+    var compact = false
 
     var body: some View {
         let player = model.player
@@ -141,7 +155,7 @@ private struct StemChannel: View {
             } label: {
                 HStack(spacing: 4) {
                     Image(systemName: kind.icon).font(.system(size: 10, weight: .semibold))
-                    Text(kind.label).font(.system(size: 11, weight: .semibold))
+                    if !compact { Text(kind.label).font(.system(size: 11, weight: .semibold)) }
                 }
                 .foregroundStyle(audible ? Color.white : theme.subtextColor)
                 .padding(.horizontal, 8).padding(.vertical, 4)
@@ -149,7 +163,7 @@ private struct StemChannel: View {
                 .overlay(Capsule().strokeBorder(kind.color.opacity(audible ? 0 : 0.6), lineWidth: 1))
             }
             .buttonStyle(.plain)
-            .help(state.muted ? "Unmute \(kind.label)" : "Mute \(kind.label)")
+            .help(state.muted ? "\(kind.label) · click to unmute" : "\(kind.label) · click to mute")
             .contextMenu {
                 Button("Solo \(kind.label)") { player.soloOnly(kind) }
                 Button("Everything except \(kind.label)") { player.muteOnly(kind) }
@@ -166,7 +180,7 @@ private struct StemChannel: View {
 
             Slider(value: Binding(get: { Double(state.volume) }, set: { player.setStemVolume(kind, Float($0)) }), in: 0...1.5)
                 .controlSize(.mini)
-                .frame(width: 54)
+                .frame(width: compact ? 46 : 54)
                 .help("\(kind.label) volume")
         }
         .padding(.horizontal, 6).padding(.vertical, 3)
