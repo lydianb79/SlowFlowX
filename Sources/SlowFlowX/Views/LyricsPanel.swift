@@ -11,7 +11,10 @@ struct LyricsPanel: View {
         VStack(alignment: .leading, spacing: 12) {
             SectionHeader(title: "Lyrics", icon: "text.quote") {
                 if let lyrics = song.lyrics, lyrics.source != .notFound {
-                    Badge(text: lyrics.source.label)
+                    Badge(text: lyrics.badgeLabel)
+                        .help(lyrics.estimated == true
+                              ? "These lyrics have no timestamps; line times are estimated from where the vocals are. Separate stems for better timing, or click a line to jump."
+                              : "")
                 }
                 Button {
                     showSearch = true
@@ -60,6 +63,8 @@ struct LyricsPanel: View {
         }
         .frame(maxHeight: .infinity, alignment: .top)
         .card()
+        .onAppear { model.estimateLyricsTiming(song.id) }
+        .onChange(of: song.id) { _, newID in model.estimateLyricsTiming(newID) }
     }
 
     private func placeholder(icon: String, title: String, text: String) -> some View {
@@ -91,12 +96,13 @@ private struct LyricsScroller: View {
         let current = lyrics.lineIndex(at: time)
         ScrollViewReader { proxy in
             ScrollView {
-                LazyVStack(alignment: .leading, spacing: 10) {
+                // Plain VStack: scrollTo is unreliable with lazy rows that haven't been laid out yet.
+                VStack(alignment: .leading, spacing: 10) {
                     ForEach(lyrics.lines) { line in
                         LyricRow(line: line,
                                  chordNames: chordNames(for: line),
                                  state: rowState(line.id, current: current),
-                                 synced: lyrics.isSynced)
+                                 synced: lyrics.hasTiming)
                             .id(line.id)
                             .onTapGesture { if let t = line.time { onSeek(t) } }
                     }
@@ -112,6 +118,15 @@ private struct LyricsScroller: View {
             .onChange(of: current) { _, newValue in
                 guard let newValue else { return }
                 withAnimation(.easeInOut(duration: 0.35)) { proxy.scrollTo(newValue, anchor: .center) }
+            }
+            .onChange(of: lyrics.hasTiming) { _, _ in
+                if let current { proxy.scrollTo(current, anchor: .center) }
+            }
+            .onAppear {
+                // Opening the panel mid-song: jump straight to the current line.
+                if let current {
+                    DispatchQueue.main.async { proxy.scrollTo(current, anchor: .center) }
+                }
             }
         }
     }

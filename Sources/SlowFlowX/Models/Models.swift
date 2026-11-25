@@ -122,11 +122,16 @@ struct Lyrics: Codable, Hashable {
     var source: LyricsSource
     var matchedArtist: String?
     var matchedTitle: String?
+    /// Plain lyrics whose line times were estimated from where the vocals are (not exact).
+    var estimated: Bool? = nil
 
     var isSynced: Bool { source == .synced || source == .transcription }
+    /// Lines have times (real or estimated), so the view can follow the song.
+    var hasTiming: Bool { isSynced || (estimated == true && lines.contains { $0.time != nil }) }
+    var badgeLabel: String { source == .plain && estimated == true ? "Timing estimated · LRCLIB" : source.label }
 
     func lineIndex(at time: Double) -> Int? {
-        guard isSynced else { return nil }
+        guard hasTiming else { return nil }
         var result: Int?
         for (i, line) in lines.enumerated() {
             guard let t = line.time else { continue }

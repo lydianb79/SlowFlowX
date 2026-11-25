@@ -235,6 +235,25 @@ final class AppModel {
             }
             update(id) { $0.lyrics = lyrics ?? Lyrics(lines: [], source: .notFound, matchedArtist: nil, matchedTitle: nil) }
             lyricsLoading.remove(id)
+            estimateLyricsTiming(id)
+        }
+    }
+
+    /// Plain lyrics have no timestamps: estimate them from the vocals so the text can follow the song.
+    func estimateLyricsTiming(_ id: String, force: Bool = false) {
+        guard let song = songs.first(where: { $0.id == id }), let lyrics = song.lyrics,
+              lyrics.source == .plain, !lyrics.lines.isEmpty,
+              force || lyrics.estimated != true else { return }
+        let vocals = song.stems?.url(.vocals, songID: id)
+            .flatMap { FileManager.default.fileExists(atPath: $0.path) ? $0 : nil }
+        let duration = song.duration
+        Task.detached(priority: .utility) {
+            let timed = LyricsTiming.estimate(lyrics, duration: duration, vocalsURL: vocals)
+            await MainActor.run {
+                self.update(id) { s in
+                    if s.lyrics?.source == .plain { s.lyrics = timed }
+                }
+            }
         }
     }
 
@@ -475,6 +494,7 @@ final class AppModel {
                 try Task.checkCancellation()
                 update(id) { $0.stems = set }
                 retempoFromDrums(id)
+                estimateLyricsTiming(id, force: true)   // vocals stem gives much better timing
                 if selectedID == id, playStems, let s = songs.first(where: { $0.id == id }) { loadStemsIntoPlayer(s) }
             } catch is CancellationError {
                 // cancelled by the user
