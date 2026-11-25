@@ -55,7 +55,7 @@ Unzip, move **SlowFlowX.app** to Applications, then **right-click → Open** the
   - **Demucs (AI, recommended)**: Meta AI Research's open-source separator runs locally and uses the GPU (MPS) on Apple Silicon. You can choose between a 6-stem, a 4-stem or a fine-tuned 4-stem model in Settings › Stems.
   - **One-click install and repair**: if Demucs is missing, **Install Demucs** in the Stems bar (or Settings › Tools) runs Homebrew → uv → Demucs on Python 3.12 with torch 2.8 for you and shows the log. SlowFlowX also self-tests Demucs (it imports everything a separation needs), so a broken install shows **Repair Demucs** instead of failing silently.
   - **Built-in (quick)**: no extra software is needed, but it is only a rough split, because vocals, kick, snare and bass usually all sit in the stereo centre. Stems made this way are marked "Quick stems", with a one-click **Redo with Demucs**. It separates the stereo centre and makes a three-way split of steady tones, drum hits and the remainder (vibrato vocals), using a **Metal median-filter kernel**. You get 4 stems.
-- **Stem mixer** under the waveform: mute, solo or set the volume of each stem while playing.
+- **Stem mixer** under the waveform: mute, solo or set the volume of each stem while playing. All six Demucs stems always fit: on narrow windows the channels switch to icon-only pills (hover for the name).
   - All stems stay sample-locked, and speed, transpose and loops still apply.
   - Right-click a stem for **Solo only** or **Everything except** (a karaoke or play-along backing track).
 - **Better transcriptions**: each part is transcribed from its isolated stem when one exists (vocal melody → vocals, bass → bass, lead and rhythm → guitar). On-device lyric transcription uses the vocals stem.
@@ -88,6 +88,7 @@ Unzip, move **SlowFlowX.app** to Applications, then **right-click → Open** the
 
 ### Lyrics
 - **Synced lyrics** from [LRCLIB](https://lrclib.net), with the chords shown above each line. The current line is highlighted and auto-scrolls; click a line to jump to it.
+- **Unsynced lyrics still follow the song**: when LRCLIB only has plain text, line times are estimated from where the vocals are (from the vocals stem when separated, skipping instrumental sections). The badge then reads "Timing estimated".
 - **Manual search** by artist and title, for when the automatic match misses.
 - **On-device transcription** with Apple's speech recogniser, as a fallback. It is approximate on music.
 
@@ -203,13 +204,14 @@ The Metal shaders are compiled at runtime from `MetalShaders.swift`. You don't n
 ```
 Sources/SlowFlowX/
   App/        SlowFlowXApp (scene, menus, key monitor), AppModel (state & workflows)
-  Audio/      PlaybackEngine (multi-stem AVAudioEngine + TimePitch), SpectrumTap (live FFT),
+  Audio/      PlaybackEngine (multi-stem AVAudioEngine + TimePitch), SpectrumTap (live FFT), TranscriptionSynth (Hear Tab),
               AudioExporter (offline WAV render of the mix or any stems)
   Analysis/   AudioLoader (decode/resample), ChordAnalyzer (STFT → chroma → Viterbi, key, tempo),
               BasicPitch (Core ML note model + note decoding, part clean-up),
               MelodyAnalyzer (neural transcription, classic salience tracker as fallback),
               OnsetDetector (attacks, beat position)
-  Models/     Song/chord/lyrics models, Melody (notes, tab fingering, MIDI & text-tab export)
+  Models/     Song/chord/lyrics models, Melody (notes, tunings, tab fingering, MIDI & text-tab export),
+              MusicXMLExport (Guitar Pro / MuseScore)
   Metal/      MetalShaders (MSL source), MetalContext (pipelines + GPU compute),
               MetalViews (waveform & spectrum renderers, mouse/trackpad handling)
   Services/   YouTubeDownloader (yt-dlp), LyricsService (LRCLIB + Speech), ProcessRunner,
