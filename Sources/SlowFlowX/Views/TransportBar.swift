@@ -4,6 +4,7 @@ struct TransportBar: View {
     @Environment(AppModel.self) private var model
     @Environment(\.appTheme) private var theme
     let song: Song
+    @State private var showTrainer = false
 
     var body: some View {
         let player = model.player
@@ -51,9 +52,16 @@ struct TransportBar: View {
                     Text("\(Int((player.rate * 100).rounded()))%")
                         .font(.system(size: 12, weight: .bold, design: .monospaced))
                         .foregroundStyle(theme.textColor)
-                    Text("pitch preserved")
-                        .font(.system(size: 10))
-                        .foregroundStyle(theme.subtextColor)
+                    if let tr = player.trainer {
+                        Text(tr.reachedTarget ? "trainer · target reached"
+                             : "trainer → \(Int((tr.target * 100).rounded()))% · pass \(tr.pass + 1)/\(tr.repeats)")
+                            .font(.system(size: 10, weight: .semibold))
+                            .foregroundStyle(theme.accent2Color)
+                    } else {
+                        Text("pitch preserved")
+                            .font(.system(size: 10))
+                            .foregroundStyle(theme.subtextColor)
+                    }
                 }
                 HStack(spacing: 8) {
                     Slider(value: Binding(get: { Double(player.rate) },
@@ -116,6 +124,16 @@ struct TransportBar: View {
                     Button { player.clearLoop() } label: { Image(systemName: "xmark") }
                         .buttonStyle(GhostButtonStyle())
                         .disabled(player.loopStart == nil && player.loopEnd == nil)
+                    Button {
+                        showTrainer = true
+                    } label: {
+                        Image(systemName: "gauge.with.needle")
+                    }
+                    .buttonStyle(GhostButtonStyle(active: player.trainer != nil))
+                    .help("Speed trainer: speed up a little every time the loop comes round")
+                    .popover(isPresented: $showTrainer, arrowEdge: .top) {
+                        SpeedTrainerPopover()
+                    }
                 }
             }
 
@@ -141,5 +159,72 @@ struct TransportBar: View {
 
     private var divider: some View {
         Rectangle().fill(theme.borderColor).frame(width: 1, height: 40)
+    }
+}
+
+/// Settings for the speed trainer: start slow, go up a step every N passes of the loop.
+private struct SpeedTrainerPopover: View {
+    @Environment(AppModel.self) private var model
+    @Environment(\.appTheme) private var theme
+    @AppStorage("trainerStart") private var start = 60
+    @AppStorage("trainerTarget") private var target = 100
+    @AppStorage("trainerStep") private var step = 5
+    @AppStorage("trainerRepeats") private var repeats = 2
+
+    var body: some View {
+        let player = model.player
+        VStack(alignment: .leading, spacing: 12) {
+            Text("Speed Trainer")
+                .font(.system(size: 13, weight: .semibold))
+            Text(player.loopEnabled
+                 ? "Plays the A–B loop, raising the speed each time it comes round."
+                 : "No loop set: the whole song is used. Set A and B to train a passage.")
+                .font(.system(size: 11))
+                .foregroundStyle(theme.subtextColor)
+                .fixedSize(horizontal: false, vertical: true)
+
+            Grid(alignment: .leading, horizontalSpacing: 10, verticalSpacing: 8) {
+                row("Start at", value: $start, range: 25...150, step: 5, unit: "%")
+                row("Up to", value: $target, range: 25...150, step: 5, unit: "%")
+                row("Step", value: $step, range: 1...25, step: 1, unit: "%")
+                row("Passes per step", value: $repeats, range: 1...10, step: 1, unit: "×")
+            }
+
+            Text("\(stepsCount) speeds · about \(stepsCount * repeats) passes")
+                .font(.system(size: 10.5))
+                .foregroundStyle(theme.subtextColor)
+
+            HStack {
+                if player.trainer != nil {
+                    Button("Stop Trainer") { player.stopTrainer() }
+                        .buttonStyle(GhostButtonStyle())
+                }
+                Spacer()
+                Button(player.trainer == nil ? "Start" : "Restart") {
+                    player.startTrainer(start: Float(start) / 100, target: Float(target) / 100,
+                                        step: Float(step) / 100, repeats: repeats)
+                }
+                .buttonStyle(PrimaryButtonStyle())
+                .keyboardShortcut(.defaultAction)
+            }
+        }
+        .padding(16)
+        .frame(width: 290)
+    }
+
+    private var stepsCount: Int { abs(target - start) / max(1, step) + 1 }
+
+    @ViewBuilder
+    private func row(_ title: String, value: Binding<Int>, range: ClosedRange<Int>, step: Int, unit: String) -> some View {
+        GridRow {
+            Text(title)
+                .font(.system(size: 12))
+                .foregroundStyle(theme.textColor)
+            Stepper(value: value, in: range, step: step) {
+                Text("\(value.wrappedValue)\(unit)")
+                    .font(.system(size: 12, weight: .semibold, design: .monospaced))
+                    .frame(width: 48, alignment: .trailing)
+            }
+        }
     }
 }

@@ -64,6 +64,8 @@ struct MelodyPanel: View {
                 .fixedSize()
 
                 Menu {
+                    Button("Export for Guitar Pro / MuseScore (MusicXML)…") { model.exportMusicXML(song.id, source: source) }
+                        .disabled(track?.usesStrums ?? true)
                     Button("Export MIDI…") { model.exportMIDI(song.id, source: source) }
                     Button("Copy as Text Tab") { model.copyASCIITab(song.id, source: source) }
                     Button("Save Text Tab…") { model.saveASCIITab(song.id, source: source) }
@@ -307,6 +309,30 @@ private struct RhythmToolbar: View {
                 }
                 .buttonStyle(GhostButtonStyle(active: true))
                 .help("This part was transcribed with an older version. Transcribe again to use the neural note model (real chords and riffs, playable fingering).")
+            }
+
+            if !track.usesStrums && !track.isEmpty {
+                let on = model.guideSource == track.source && model.player.guideActive
+                Button {
+                    model.setGuide(song.id, source: on ? nil : track.source)
+                } label: {
+                    if model.guideRendering {
+                        HStack(spacing: 4) { ProgressView().controlSize(.mini); Text("Hear Tab") }
+                    } else {
+                        Label("Hear Tab", systemImage: on ? "speaker.wave.2.fill" : "speaker.wave.2")
+                    }
+                }
+                .font(.system(size: 11.5, weight: .semibold))
+                .buttonStyle(GhostButtonStyle(active: on))
+                .disabled(model.guideRendering)
+                .help("Play the transcription with a synth along with the song (follows speed, loop and transpose). Mute or solo stems to compare it with the real part.")
+                if on {
+                    Slider(value: Binding(get: { Double(model.player.guideVolume) },
+                                          set: { model.player.setGuideVolume(Float($0)) }), in: 0...1.5)
+                        .controlSize(.mini)
+                        .frame(width: 60)
+                        .help("Volume of the transcription synth")
+                }
             }
 
             if track.source != .vocal && !track.usesStrums {

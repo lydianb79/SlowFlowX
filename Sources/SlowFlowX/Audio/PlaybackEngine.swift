@@ -38,6 +38,23 @@ final class PlaybackEngine {
     private(set) var loopStart: Double?
     private(set) var loopEnd: Double?
 
+    /// Synthesized transcription played along with the song ("hear the tab").
+    @ObservationIgnored private var guideURL: URL?
+    @ObservationIgnored private var baseTracks: [(String, URL)] = []
+    private(set) var guideActive = false
+    private(set) var guideVolume: Float = 0.8
+
+    /// Speed trainer: each time the loop (or song) comes round, the speed goes up a step.
+    struct SpeedTrainer: Equatable {
+        var start: Float
+        var target: Float
+        var step: Float
+        var repeats: Int          // passes at each speed before stepping up
+        var pass = 0
+        var reachedTarget = false
+    }
+    private(set) var trainer: SpeedTrainer?
+
     /// Stems currently loaded (empty when playing the original mix).
     private(set) var stemKinds: [StemKind] = []
     private(set) var mix: [StemKind: StemMixState] = [:]
@@ -69,6 +86,8 @@ final class PlaybackEngine {
 
     /// Plays the original mix.
     func load(url: URL) throws {
+        guideURL = nil
+        trainer = nil
         try load(tracks: [("mix", url)])
         stemKinds = []
         mix = [:]
@@ -96,7 +115,9 @@ final class PlaybackEngine {
     func switchToMix(url: URL) throws {
         let t = currentTime, wasPlaying = isPlaying
         let a = loopStart, b = loopEnd, looping = loopEnabled
-        try load(url: url)
+        try load(tracks: [("mix", url)])
+        stemKinds = []
+        mix = [:]
         loopStart = a; loopEnd = b; loopEnabled = looping
         seek(to: t)
         if wasPlaying { play() }
@@ -113,8 +134,11 @@ final class PlaybackEngine {
         engine.disconnectNodeOutput(submix)
         engine.disconnectNodeOutput(timePitch)
 
+        baseTracks = tracks
+        var all = tracks
+        if let g = guideURL { all.append(("guide", g)) }
         var newSources: [Source] = []
-        for (key, url) in tracks {
+        for (key, url) in all {
             let f = try AVAudioFile(forReading: url)
             let p = AVAudioPlayerNode()
             engine.attach(p)
@@ -134,12 +158,68 @@ final class PlaybackEngine {
         segmentStartTime = 0
         isScheduled = false
         loopStart = nil; loopEnd = nil; loopEnabled = false
+        guideActive = guideURL != nil
+        applyMix()
         engine.prepare()
         try engine.start()
         isLoaded = true
     }
 
+    // MARK: Guide track (hear the transcription)
+
+    /// Plays `url` (a rendering of the transcription, same length as the song) in sync with the
+    /// song; nil removes it. Keeps position, loop and play state.
+    func setGuide(_ url: URL?) throws {
+        guard isLoaded, !baseTracks.isEmpty else { return }
+        let t = currentTime, wasPlaying = isPlaying
+        let a = loopStart, b = loopEnd, looping = loopEnabled
+        let kinds = stemKinds, m = mix
+        guideURL = url
+        try load(tracks: baseTracks)
+        stemKinds = kinds
+        mix = m
+        applyMix()
+        loopStart = a; loopEnd = b; loopEnabled = looping
+        seek(to: t)
+        if wasPlaying { play() }
+    }
+
+    func setGuideVolume(_ v: Float) {
+        guideVolume = min(max(v, 0), 1.5)
+        applyMix()
+    }
+
+    // MARK: Speed trainer
+
+    func startTrainer(start: Float, target: Float, step: Float, repeats: Int) {
+        let lo = min(max(start, 0.25), 2), hi = min(max(target, 0.25), 2)
+        trainer = SpeedTrainer(start: lo, target: hi, step: max(0.01, abs(step)), repeats: max(1, repeats))
+        setRate(lo)
+        if loopEnabled, let a = loopStart { seek(to: a) }
+        if !isPlaying { play() }
+    }
+
+    func stopTrainer() { trainer = nil }
+
+    /// Called whenever playback wraps around (loop end, or song end while training).
+    private func trainerWrapped() {
+        guard var tr = trainer else { return }
+        tr.pass += 1
+        if tr.pass >= tr.repeats && !tr.reachedTarget {
+            tr.pass = 0
+            let up = tr.target >= tr.start
+            var next = rate + (up ? tr.step : -tr.step)
+            next = up ? min(next, tr.target) : max(next, tr.target)
+            setRate((next * 100).rounded() / 100)
+            if abs(rate - tr.target) < 0.001 { tr.reachedTarget = true }
+        }
+        trainer = tr
+    }
+
     func unload() {
+        guideURL = nil
+        guideActive = false
+        trainer = nil
         stopInternal()
         engine.stop()
         for s in sources {
@@ -199,7 +279,9 @@ final class PlaybackEngine {
 
     private func applyMix() {
         for s in sources {
-            if let k = StemKind(rawValue: s.key) { s.player.volume = effectiveGain(k) } else { s.player.volume = 1 }
+            if s.key == "guide" { s.player.volume = guideVolume }
+            else if let k = StemKind(rawValue: s.key) { s.player.volume = effectiveGain(k) }
+            else { s.player.volume = 1 }
         }
     }
 
@@ -329,7 +411,14 @@ final class PlaybackEngine {
 
     private func playbackReachedEnd() {
         if loopEnabled, let a = loopStart {
+            trainerWrapped()
             seek(to: a)
+            return
+        }
+        if trainer != nil {
+            // training on the whole song: start over at the next speed
+            trainerWrapped()
+            seek(to: 0)
             return
         }
         for s in sources { s.player.stop() }
@@ -346,6 +435,7 @@ final class PlaybackEngine {
         let t = segmentStartTime + max(0, Double(pt.sampleTime)) / pt.sampleRate
         currentTime = max(0, min(t, duration))
         if loopEnabled, let a = loopStart, let b = loopEnd, b > a, currentTime >= b {
+            trainerWrapped()
             seek(to: a)
         }
     }

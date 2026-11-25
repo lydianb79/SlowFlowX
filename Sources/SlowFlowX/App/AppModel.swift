@@ -51,6 +51,9 @@ final class AppModel {
     var showExportSheet = false
     /// Progress of melody transcriptions, keyed by "songID|source".
     var melodyStatus: [String: AnalysisStatus] = [:]
+    /// Part whose transcription is playing along with the song (selected song only).
+    var guideSource: MelodySource?
+    var guideRendering = false
     /// Stem-separation progress keyed by song id.
     var stemStatus: [String: AnalysisStatus] = [:]
     /// Play separated stems (when available) instead of the original mix.
@@ -107,6 +110,7 @@ final class AppModel {
     func select(_ id: String?) {
         guard id != selectedID else { return }
         selectedID = id
+        guideSource = nil
         guard let song = selectedSong else { player.unload(); return }
         do {
             try player.load(url: song.audioURL)
@@ -314,10 +318,45 @@ final class AppModel {
                     m[source.rawValue] = track
                     song.melodies = m
                 }
+                if guideSource == source && selectedID == id { setGuide(id, source: source) }   // re-render
             } catch {
                 show("Transcription failed", error.localizedDescription)
             }
             melodyStatus[key] = nil
+        }
+    }
+
+    // MARK: Hear the transcription
+
+    /// Plays a synthesized rendering of a transcribed part along with the song (nil = off),
+    /// so you can hear where the tab differs from the recording.
+    func setGuide(_ id: String, source: MelodySource?) {
+        guard let song = songs.first(where: { $0.id == id }), selectedID == id else { return }
+        guard let source, let track = song.melodies?[source.rawValue], !track.isEmpty, !track.usesStrums else {
+            guideSource = nil
+            do { try player.setGuide(nil) } catch { show("Couldn't change playback", error.localizedDescription) }
+            return
+        }
+        guideRendering = true
+        let stamp = Int(track.analyzedAt.timeIntervalSince1970)
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("SlowFlowX-guide-\(id)-\(source.rawValue)-\(stamp)-\(track.notes.count).caf")
+        let duration = player.duration > 0 ? player.duration : song.duration
+        Task {
+            do {
+                if !FileManager.default.fileExists(atPath: url.path) {
+                    try await Task.detached(priority: .userInitiated) {
+                        try TranscriptionSynth.render(track, duration: duration, to: url)
+                    }.value
+                }
+                if selectedID == id {
+                    try player.setGuide(url)
+                    guideSource = source
+                }
+            } catch {
+                show("Couldn't play the transcription", error.localizedDescription)
+            }
+            guideRendering = false
         }
     }
 
@@ -334,6 +373,26 @@ final class AppModel {
                                          resolution: Self.quantizeResolution)
         do {
             try data.write(to: url, options: .atomic)
+            NSWorkspace.shared.activateFileViewerSelecting([url])
+        } catch {
+            show("Export failed", error.localizedDescription)
+        }
+    }
+
+    /// Tab / notation for Guitar Pro, MuseScore or TuxGuitar.
+    func exportMusicXML(_ id: String, source: MelodySource) {
+        guard let song = songs.first(where: { $0.id == id }), let track = song.melodies?[source.rawValue] else { return }
+        let panel = NSSavePanel()
+        panel.title = "Export for Guitar Pro / MuseScore"
+        panel.message = "MusicXML opens in Guitar Pro (File › Import › MusicXML), MuseScore and TuxGuitar."
+        panel.allowedContentTypes = [UTType(filenameExtension: "musicxml") ?? .xml]
+        panel.nameFieldStringValue = "\(song.displayTitle) - \(source.shortLabel).musicxml"
+            .replacingOccurrences(of: "/", with: "-").replacingOccurrences(of: ":", with: "-")
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        let xml = MusicXMLExport.document(track: track, title: song.displayTitle, artist: song.displayArtist,
+                                          fallbackBPM: song.analysis?.bpm ?? 0, transpose: player.pitchSemitones)
+        do {
+            try xml.write(to: url, atomically: true, encoding: .utf8)
             NSWorkspace.shared.activateFileViewerSelecting([url])
         } catch {
             show("Export failed", error.localizedDescription)

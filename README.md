@@ -81,6 +81,8 @@ Unzip, move **SlowFlowX.app** to Applications, then **right-click → Open** the
 - **Piano roll** with a keyboard whose keys light up as each note plays, plus note names on the bars.
 - A **current / next notes** display, with the current lyric line underneath.
 - Drag to scrub and click to jump. Speed, looping and transpose all apply (transposing re-fingers the tab).
+- **Hear Tab**: plays the transcription with a built-in synth (plucked strings for guitar and bass, a soft tone for vocals), in sync with the song. It follows speed, loop and transpose. Mute or solo stems to compare it with the real part and hear where the tab is wrong.
+- **Export for Guitar Pro / MuseScore / TuxGuitar** as MusicXML: a TAB staff with the tuning and every note's string and fret, rhythm on the 16th grid, tied across bar lines, plus the tempo. In Guitar Pro, use File › Import › MusicXML.
 - **Export MIDI** (open it in GarageBand, Logic or MuseScore to see sheet music; notes are on the 16th grid and the first beat is aligned to the bar), or **copy / save a plain-text tab** with a rhythm line and down/up strum markers.
 - Transcription is automatic and approximate. It works best when the part stands out in the mix.
 
@@ -99,6 +101,7 @@ Unzip, move **SlowFlowX.app** to Applications, then **right-click → Open** the
   - A time ruler, and a chord lane that zooms with the waveform.
   - The view follows the playhead while playing.
 - **A–B looping**, plus "Play Section" and "Zoom to Section".
+- **Speed trainer**: start slow and raise the speed a step every N passes of the loop, up to a target (for example 60% → 100% in 5% steps, two passes each). Without a loop it trains on the whole song.
 - A **live spectrum analyser** (Metal) fed from an audio-engine tap.
 
 ### Export
