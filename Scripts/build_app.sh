@@ -55,6 +55,17 @@ for ARCH in $ARCHS; do
   cp "$ICNS" "$APP/Contents/Resources/AppIcon.icns"
   printf 'APPL????' > "$APP/Contents/PkgInfo"
 
+  # Note-transcription model (Spotify Basic Pitch, Apache-2.0). Compiled ahead of time when the
+  # Core ML compiler is available; otherwise the app compiles the .mlpackage on first use.
+  mkdir -p "$APP/Contents/Resources/BasicPitch"
+  cp Resources/BasicPitch/LICENSE Resources/BasicPitch/NOTICE "$APP/Contents/Resources/BasicPitch/"
+  if xcrun --find coremlcompiler >/dev/null 2>&1 && \
+     xcrun coremlcompiler compile Resources/BasicPitch/nmp.mlpackage "$APP/Contents/Resources/BasicPitch" >/dev/null; then
+    echo "  compiled Basic Pitch model"
+  else
+    cp -R Resources/BasicPitch/nmp.mlpackage "$APP/Contents/Resources/BasicPitch/"
+  fi
+
   echo "▸ Signing $ARCH (ad-hoc)"
   codesign --force --deep --sign - "$APP"
 

@@ -285,6 +285,11 @@ final class AppModel {
                 }.value
                 track.stemUsed = usedStem
                 track.version = MelodyTrack.currentVersion
+                if let old = songs.first(where: { $0.id == id })?.melodies?[source.rawValue],
+                   old.tuningUserSet == true, track.usesNeuralModel {
+                    track.tuningID = old.tuningID
+                    track.tuningUserSet = true
+                }
                 update(id) { song in
                     var m = song.melodies ?? [:]
                     m[source.rawValue] = track
@@ -327,6 +332,17 @@ final class AppModel {
     /// Exports place notes on the 16th-note grid, like the sheet-style tab view.
     static var quantizeResolution: Int { 1 }
 
+    /// Tuning the tab of a part is written for.
+    func setTuning(_ id: String, source: MelodySource, tuningID: String) {
+        update(id) { song in
+            guard var m = song.melodies, var t = m[source.rawValue] else { return }
+            t.tuningID = tuningID
+            t.tuningUserSet = true
+            m[source.rawValue] = t
+            song.melodies = m
+        }
+    }
+
     /// Adjust the detected tempo of a part (e.g. halve or double when the guess is off).
     /// Tempo is a property of the song: changing it updates the song and every transcribed part.
     func setMelodyTempo(_ id: String, source: MelodySource, bpm: Double) {
@@ -345,7 +361,6 @@ final class AppModel {
             guard var m = song.melodies else { return }
             for k in Array(m.keys) {
                 guard var t = m[k] else { continue }
-                if t.isOutdated { t.version = MelodyTrack.currentVersion }
                 t.bpm = clamped
                 if let offset { t.beatOffset = offset } else if t.beatOffset == nil { t.beatOffset = 0 }
                 m[k] = t

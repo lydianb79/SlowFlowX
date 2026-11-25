@@ -61,17 +61,16 @@ Unzip, move **SlowFlowX.app** to Applications, then **right-click → Open** the
 - **Better transcriptions**: each part is transcribed from its isolated stem when one exists (vocal melody → vocals, bass → bass, lead and rhythm → guitar). On-device lyric transcription uses the vocals stem.
 
 ### Tab & notes (riffs and melodies)
-- **Melody transcription**: pick the **vocal melody**, a **lead guitar riff**, the **rhythm guitar** or the **bass line**, and SlowFlowX transcribes it.
-  - The **`melody_salience` Metal compute kernel** scores how strong every possible pitch is in each 12 ms frame. It sums the harmonics and suppresses octave errors.
-  - A **Viterbi pitch tracker** detects where the part is playing and keeps glides and vibrato smooth.
-  - Semitone **note segmentation** turns the pitch line into separate notes.
-  - **Accurate note lengths**: an attack detector splits repeated notes (e.g. chugging riffs) into separate hits and snaps each note to its attack. For guitar and bass, notes end when the pitch dies away rather than when it disappears completely.
-  - **Octave slips** (short notes an octave away from both neighbours) are corrected.
-- **Rhythm guitar**: strums are detected from attacks and labelled **↓ down / ↑ up**. Down falls on the beat, up between beats. If a fair share of strums land on in-between 16ths, the pattern is treated as 16th-note strumming. Each strum shows the chord shape from the chord analysis, in the tab and in the piano roll.
+- **Melody transcription**: pick the **vocal melody**, a **lead guitar riff**, the **rhythm guitar** or the **bass line**, and SlowFlowX transcribes it from its isolated stem.
+  - **Neural, polyphonic note detection**: notes come from Spotify's open-source **Basic Pitch** model, run natively with **Core ML** (Neural Engine / GPU on Apple Silicon). No Python and no download is needed: the model ships inside the app. It hears **chords, power chords and double stops**, not just a single line, and gets attacks and note lengths right on fast riffs.
+  - **Part clean-up**: overtone "ghost" notes riding on a stronger note are removed. Voice and bass are reduced to one line, lead to at most two notes at a time, and rhythm guitar keeps full chords.
+  - **Rhythm guitar shows what is really played**: the actual chord voicings and riffs, instead of generic shapes from the chord analysis.
+  - If the model can't be loaded, SlowFlowX falls back to the classic single-note tracker (Metal harmonic salience → Viterbi → note segmentation).
 - **Guitar / bass tab in a printed-sheet layout**:
   - Several bars per line, depending on window width, with lines stacked. The current bar is highlighted and the page turns as the song plays.
   - Notes sit on a 16th-note grid with **rhythm notation** underneath (stems, flags, dots, beams per beat). Chord names, bar numbers and beat ticks are shown, plus ↓/↑ strum arrows for the rhythm part.
-  - **Realistic fingering**: the fretting hand sits in a four-fret position (index finger at fret 12 or below) and only moves when it must, so passages stay compact and the same note keeps the same fret. Standard EADGBE tuning, or EADG for bass. Notes outside the range are moved by an octave and marked 8va/8vb.
+  - **Playable fingering**: notes that sound together become a real chord shape (one note per string, within a hand span, lower notes on lower strings). The fretting hand sits in a four-fret position and only moves when it must, preferring the lower neck and open strings where they fit. Notes outside the range are moved by an octave and marked 8va/8vb.
+  - **Tunings**: Standard, E♭, Drop D, D, Drop C♯, Drop C, C, Drop B, B, Drop A, 7-string (B, Drop A) and 8-string for guitar; Standard, E♭, Drop D, D, Drop C and 5-string for bass. The tuning is **suggested from the part's lowest notes** and can be changed from the toolbar; the tab is re-fingered instantly.
   - Click anywhere in the tab to jump there.
 - **Tempo and bars** (one tempo per song, shared by all parts):
   - Detected with an onset-envelope autocorrelation that weighs several metrical levels. After stem separation it is **re-detected from the drums stem**, together with the bar position. The beat grid for transcriptions also comes from the drums stem or the full mix, never from an isolated vocal or guitar stem.
@@ -204,7 +203,8 @@ Sources/SlowFlowX/
   Audio/      PlaybackEngine (multi-stem AVAudioEngine + TimePitch), SpectrumTap (live FFT),
               AudioExporter (offline WAV render of the mix or any stems)
   Analysis/   AudioLoader (decode/resample), ChordAnalyzer (STFT → chroma → Viterbi, key, tempo),
-              MelodyAnalyzer (harmonic salience → pitch tracking → notes, strums),
+              BasicPitch (Core ML note model + note decoding, part clean-up),
+              MelodyAnalyzer (neural transcription, classic salience tracker as fallback),
               OnsetDetector (attacks, beat position)
   Models/     Song/chord/lyrics models, Melody (notes, tab fingering, MIDI & text-tab export)
   Metal/      MetalShaders (MSL source), MetalContext (pipelines + GPU compute),
@@ -233,13 +233,14 @@ Your library (audio, stems and analysis) is stored in `~/Library/Application Sup
 - **Demucs won't install** (Rust / PyO3 / "Python version is newer than … supported"): install with Python 3.12 as shown under Requirements.
 - **Demucs installed but separation fails**: use **Repair Demucs** (Stems bar or Settings › Tools).
 - **Demucs fails or is slow**: make sure `demucs` runs in Terminal (`demucs --help`). A TorchCodec error means torchaudio is too new, so reinstall with the 2.8 pins. The first run downloads the model. If the GPU fails, SlowFlowX retries on the CPU, which is slower. The built-in separator always works.
-- **Messy tab / notes**: separate the stems first, then use **Transcribe from Stem**. try another part (Vocal, Lead or Bass). Transcription follows whichever part is loudest in its range, so busy mixes produce stray notes. Slowing down doesn't affect the transcription, but it makes checking by ear much easier.
+- **Messy tab / notes**: separate the stems with Demucs first, then use **Transcribe from Stem**. Parts transcribed before version 1.1 show **Update Transcription** (it switches them to the neural model). If the shapes look unplayable, check the **tuning** menu: down-tuned songs look wrong in standard tuning. Two guitars on one stem (lead and rhythm together) are transcribed together. Slowing down doesn't affect the transcription, but it makes checking by ear much easier.
 - **Wrong chords**: automatic recognition is an estimate. It is very good for practice charts, but dense mixes, heavy distortion or jazz voicings will cause errors. Use the chord grid together with your ears.
 
 ## Credits
 
 - Audio download: [yt-dlp](https://github.com/yt-dlp/yt-dlp) and [FFmpeg](https://ffmpeg.org)
 - Synced lyrics: [LRCLIB](https://lrclib.net)
+- Note transcription: [Basic Pitch](https://github.com/spotify/basic-pitch) by Spotify (Apache-2.0; model in `Resources/BasicPitch` with its LICENSE and NOTICE)
 - AI stem separation: [Demucs](https://github.com/facebookresearch/demucs) (Meta AI Research)
 - Time-stretching, speech recognition and DSP: Apple AVFoundation, Speech and Accelerate
 

@@ -71,7 +71,7 @@ struct MelodyNote: Codable, Hashable, Identifiable {
     var midi: Int
     var confidence: Float
 
-    var id: Double { start }
+    var id: String { "\(start)|\(midi)" }
     var duration: Double { end - start }
 
     func name(transpose: Int = 0) -> String { MidiNote.name(midi + transpose) }
@@ -101,11 +101,29 @@ struct MelodyTrack: Codable, Hashable {
     var stemUsed: String? = nil
     /// Transcription algorithm version (older tracks offer "Update Transcription").
     var version: Int? = nil
-    static let currentVersion = 3
+    /// Tuning used for the tab (id of a `Tuning` preset; nil = standard).
+    var tuningID: String? = nil
+    /// true when the player picked the tuning (kept when the part is transcribed again).
+    var tuningUserSet: Bool? = nil
+    /// "basic-pitch" (neural, polyphonic) or nil (classic single-pitch tracker).
+    var engine: String? = nil
+    static let currentVersion = 4
     var isOutdated: Bool { (version ?? 0) < Self.currentVersion }
+    var usesNeuralModel: Bool { engine == "basic-pitch" }
 
-    var isEmpty: Bool { source.isRhythm ? (strums ?? []).isEmpty : notes.isEmpty }
-    var eventCount: Int { source.isRhythm ? (strums ?? []).count : notes.count }
+    /// Older rhythm tracks only know strum times (shapes came from the chord analysis);
+    /// new ones contain the real notes that were played.
+    var usesStrums: Bool { source.isRhythm && notes.isEmpty && !(strums ?? []).isEmpty }
+
+    var isEmpty: Bool { usesStrums ? (strums ?? []).isEmpty : notes.isEmpty }
+    var eventCount: Int { usesStrums ? (strums ?? []).count : notes.count }
+
+    /// Instrument and tuning the tab is written for.
+    var instrument: TabInstrument {
+        let fallback = source.tabInstrument
+        guard let t = Tuning.preset(tuningID), t.isBass == fallback.isBass else { return fallback }
+        return t
+    }
 
     func noteIndex(at time: Double) -> Int? {
         guard !notes.isEmpty else { return nil }
@@ -131,7 +149,7 @@ struct MelodyTrack: Codable, Hashable {
     func grid(fallbackBPM: Double) -> RhythmGrid {
         // Tracks from older versions measured tempo on the isolated stem, which is unreliable:
         // use the song's tempo for them until they are transcribed again.
-        let trusted = !isOutdated
+        let trusted = (version ?? 0) >= 3
         let own = trusted ? (bpm ?? 0) : 0
         let b = own > 30 ? own : (fallbackBPM > 30 ? fallbackBPM : 120)
         return RhythmGrid(bpm: b, offset: trusted ? (beatOffset ?? 0) : 0)
@@ -139,7 +157,7 @@ struct MelodyTrack: Codable, Hashable {
 
     /// Notes to display for this part. For the rhythm part these are the chord tones of each strum.
     func displayNotes(chords: [ChordSegment]) -> [MelodyNote] {
-        guard source.isRhythm else { return notes }
+        guard usesStrums else { return notes }
         var out: [MelodyNote] = []
         for s in strums ?? [] {
             guard let chord = Self.chord(at: s.start + 0.02, in: chords) else { continue }
@@ -252,16 +270,89 @@ enum RhythmQuantizer {
 
 // MARK: - Tab fingering
 
-enum TabInstrument {
-    case guitar, bass
+/// A tuning: open-string MIDI notes from the lowest string up.
+struct Tuning: Hashable, Identifiable {
+    let id: String
+    let name: String
+    let openNotes: [Int]
+    let isBass: Bool
 
-    /// Open-string MIDI notes, low → high.
-    var tuning: [Int] { self == .guitar ? [40, 45, 50, 55, 59, 64] : [28, 33, 38, 43] }
-    var stringNames: [String] { self == .guitar ? ["E", "A", "D", "G", "B", "e"] : ["E", "A", "D", "G"] }
-    var maxFret: Int { 20 }
-    var lowest: Int { tuning[0] }
-    var highest: Int { tuning[tuning.count - 1] + maxFret }
+    var tuning: [Int] { openNotes }
+    var stringCount: Int { openNotes.count }
+    var maxFret: Int { isBass ? 20 : 22 }
+    var lowest: Int { openNotes[0] }
+    var highest: Int { openNotes[openNotes.count - 1] + maxFret }
+
+    /// Letter names, low → high. The top string is lower-case when it repeats the bottom one (E…e).
+    var stringNames: [String] {
+        var names = openNotes.map { ChordNaming.noteName(((($0 % 12) + 12) % 12)) }
+        if names.count > 1, names[names.count - 1] == names[0] { names[names.count - 1] = names[names.count - 1].lowercased() }
+        return names
+    }
+
+    /// e.g. "Drop C (CGCFAD)"
+    var label: String { "\(name) (\(openNotes.map { ChordNaming.noteName((($0 % 12) + 12) % 12) }.joined()))" }
+
+    static let guitar = Tuning(id: "std", name: "Standard", openNotes: [40, 45, 50, 55, 59, 64], isBass: false)
+    static let bass = Tuning(id: "bass-std", name: "Standard", openNotes: [28, 33, 38, 43], isBass: true)
+
+    static let guitarPresets: [Tuning] = [
+        guitar,
+        Tuning(id: "eb", name: "E♭ Standard", openNotes: [39, 44, 49, 54, 58, 63], isBass: false),
+        Tuning(id: "dropd", name: "Drop D", openNotes: [38, 45, 50, 55, 59, 64], isBass: false),
+        Tuning(id: "d", name: "D Standard", openNotes: [38, 43, 48, 53, 57, 62], isBass: false),
+        Tuning(id: "dropcs", name: "Drop C♯", openNotes: [37, 44, 49, 54, 58, 63], isBass: false),
+        Tuning(id: "dropc", name: "Drop C", openNotes: [36, 43, 48, 53, 57, 62], isBass: false),
+        Tuning(id: "c", name: "C Standard", openNotes: [36, 41, 46, 51, 55, 60], isBass: false),
+        Tuning(id: "dropb", name: "Drop B", openNotes: [35, 42, 47, 52, 56, 61], isBass: false),
+        Tuning(id: "b", name: "B Standard", openNotes: [35, 40, 45, 50, 54, 59], isBass: false),
+        Tuning(id: "dropa", name: "Drop A", openNotes: [33, 40, 45, 50, 54, 59], isBass: false),
+        Tuning(id: "7b", name: "7-string Standard", openNotes: [35, 40, 45, 50, 55, 59, 64], isBass: false),
+        Tuning(id: "7dropa", name: "7-string Drop A", openNotes: [33, 40, 45, 50, 55, 59, 64], isBass: false),
+        Tuning(id: "8fs", name: "8-string Standard", openNotes: [30, 35, 40, 45, 50, 55, 59, 64], isBass: false),
+    ]
+
+    static let bassPresets: [Tuning] = [
+        bass,
+        Tuning(id: "bass-eb", name: "E♭ Standard", openNotes: [27, 32, 37, 42], isBass: true),
+        Tuning(id: "bass-dropd", name: "Drop D", openNotes: [26, 33, 38, 43], isBass: true),
+        Tuning(id: "bass-d", name: "D Standard", openNotes: [26, 31, 36, 41], isBass: true),
+        Tuning(id: "bass-dropc", name: "Drop C", openNotes: [24, 31, 36, 41], isBass: true),
+        Tuning(id: "bass-5", name: "5-string", openNotes: [23, 28, 33, 38, 43], isBass: true),
+    ]
+
+    static func presets(bass: Bool) -> [Tuning] { bass ? bassPresets : guitarPresets }
+
+    static func preset(_ id: String?) -> Tuning? {
+        guard let id else { return nil }
+        return (guitarPresets + bassPresets).first { $0.id == id }
+    }
+
+    /// Picks the tuning a part was most likely played in from its lowest notes: the highest-pitched
+    /// tuning that still reaches them, preferring drop tunings when the low string is used
+    /// together with the string above it a fifth higher (power chords on one finger).
+    static func suggest(for notes: [MelodyNote], bass: Bool) -> Tuning {
+        let pitches = notes.filter { $0.confidence > 0.25 && $0.duration > 0.06 }.map(\.midi).sorted()
+        guard pitches.count >= 8 else { return bass ? Self.bass : Self.guitar }
+        // ignore the odd stray note: 1st percentile, but at least 3 notes at/below it
+        let low = pitches[min(pitches.count - 1, max(2, pitches.count / 100))]
+        let options = Self.presets(bass: bass)
+        let standard = options[0]
+        if low >= standard.lowest { return standard }
+
+        let reaching = options.filter { $0.lowest <= low }
+        guard !reaching.isEmpty else { return options.min { $0.lowest < $1.lowest } ?? standard }
+        let best = reaching.max { a, b in
+            if a.lowest != b.lowest { return a.lowest < b.lowest }
+            // same low note: fewer strings first, then the drop tuning (most common in rock/metal)
+            if a.stringCount != b.stringCount { return a.stringCount > b.stringCount }
+            return !a.name.hasPrefix("Drop") && b.name.hasPrefix("Drop")
+        }
+        return best ?? standard
+    }
 }
+
+typealias TabInstrument = Tuning
 
 struct TabPosition: Hashable {
     let string: Int   // 0 = lowest string
@@ -269,101 +360,187 @@ struct TabPosition: Hashable {
     let octaveShift: Int  // octaves the note was moved to fit the instrument (0 = as played)
 }
 
+/// Notes that start together form one tab event (a chord / double stop).
+enum NoteGrouping {
+    static let tolerance = 0.035
+
+    /// Indices of `notes` (sorted by start) grouped by common start time.
+    static func groups(_ notes: [MelodyNote]) -> [[Int]] {
+        var out: [[Int]] = []
+        var groupStart = -Double.infinity
+        for (i, n) in notes.enumerated() {
+            if !out.isEmpty && n.start - groupStart <= tolerance {
+                out[out.count - 1].append(i)
+            } else {
+                out.append([i]); groupStart = n.start
+            }
+        }
+        return out
+    }
+}
+
 enum TabFingering {
-    /// Chooses a string/fret for every note the way a player would: the fretting hand sits in a
-    /// position (index finger on fret P, covering frets P…P+3) and only moves when it has to.
-    /// A dynamic-programming pass picks the sequence of hand positions with the least movement,
-    /// then each note is placed inside its position, preferring small string changes.
-    static func positions(for notes: [MelodyNote], instrument: TabInstrument, transpose: Int) -> [TabPosition] {
+    /// A way to fret one event: one position per note of the group (nil = left out).
+    private struct Shape {
+        var positions: [Int: TabPosition]   // note index → position
+        var low: Int                        // lowest fretted fret (Int.max if all open)
+        var high: Int                       // highest fretted fret
+        var intrinsic: Double               // cost independent of hand position
+        var lowestString: Int
+    }
+
+    /// Chooses string and fret for every note the way a guitarist would:
+    /// - notes that sound together become a chord shape: one note per string, within a hand span,
+    ///   lower notes on lower strings (notes that can't be fitted are dropped, weakest first);
+    /// - the fretting hand sits in a position (index finger on fret P, covering P…P+3) and a
+    ///   dynamic-programming pass picks the sequence of positions with the least movement,
+    ///   preferring the lower half of the neck and open strings where they fit.
+    /// Returns one position per note; nil where a note was left out of an unplayable chord.
+    static func positions(for notes: [MelodyNote], instrument: TabInstrument, transpose: Int) -> [TabPosition?] {
         guard !notes.isEmpty else { return [] }
         let tuning = instrument.tuning
+        let groups = NoteGrouping.groups(notes)
 
-        // Candidate (string, fret) pairs per note, after folding into the instrument's range.
-        var candidates: [[TabPosition]] = []
-        for n in notes {
-            var midi = n.midi + transpose
-            var shift = 0
-            while midi < instrument.lowest { midi += 12; shift += 1 }
-            while midi > instrument.highest { midi -= 12; shift -= 1 }
-            var c: [TabPosition] = []
-            for (s, open) in tuning.enumerated() {
-                let f = midi - open
-                if f >= 0 && f <= instrument.maxFret { c.append(TabPosition(string: s, fret: f, octaveShift: shift)) }
-            }
-            if c.isEmpty { c.append(TabPosition(string: 0, fret: 0, octaveShift: shift)) }
-            candidates.append(c)
+        // Pitch of each note after folding it into the instrument's range.
+        var pitch = [Int](repeating: 0, count: notes.count)
+        var shift = [Int](repeating: 0, count: notes.count)
+        for (i, n) in notes.enumerated() {
+            var m = n.midi + transpose, s = 0
+            while m < instrument.lowest { m += 12; s += 1 }
+            while m > instrument.highest { m -= 12; s -= 1 }
+            pitch[i] = m; shift[i] = s
         }
 
-        let positions = Array(1...12)          // index-finger fret (keeps the hand below the 15th fret)
+        func enumerateShapes(_ members: [Int]) -> [Shape] {
+            var result: [Shape] = []
+            var current: [Int: TabPosition] = [:]
+            func rec(_ k: Int, _ minString: Int, _ lo: Int, _ hi: Int) {
+                if result.count > 400 { return }
+                if k == members.count {
+                    let span = hi >= lo ? hi - lo : 0
+                    let used = current.values.map(\.string).sorted()
+                    let skipped = used.count > 1 ? (used.last! - used.first! + 1 - used.count) : 0
+                    let opens = current.values.filter { $0.fret == 0 }.count
+                    var cost = Double(max(0, span - 3)) * 1.2 + Double(skipped) * 0.25
+                    if members.count > 1 && opens > 0 && opens < members.count && span > 2 { cost += 0.4 } // awkward mix
+                    result.append(Shape(positions: current, low: lo == Int.max ? Int.max : lo, high: hi,
+                                        intrinsic: cost, lowestString: used.first ?? 0))
+                    return
+                }
+                let i = members[k]
+                for s in minString..<tuning.count {
+                    let f = pitch[i] - tuning[s]
+                    guard f >= 0 && f <= instrument.maxFret else { continue }
+                    var nlo = lo, nhi = hi
+                    if f > 0 { nlo = min(lo, f); nhi = max(hi, f) }
+                    if nhi >= nlo && nhi != Int.min && nlo != Int.max && nhi - nlo > 4 { continue }   // beyond a stretch
+                    current[i] = TabPosition(string: s, fret: f, octaveShift: shift[i])
+                    rec(k + 1, s + 1, nlo, nhi)
+                    current[i] = nil
+                }
+            }
+            rec(0, 0, Int.max, Int.min)
+            return result
+        }
+
+        // Candidate shapes per group (dropping notes until something is playable).
+        var shapes: [[Shape]] = []
+        for g in groups {
+            // one note per pitch, low → high
+            var seen = Set<Int>()
+            var members = g.sorted { pitch[$0] < pitch[$1] }.filter { seen.insert(pitch[$0]).inserted }
+            var found = enumerateShapes(members)
+            while found.isEmpty && members.count > 1 {
+                // drop the weakest note other than the lowest (the bass of the chord matters most)
+                let rest = members.dropFirst()
+                if let weakest = rest.min(by: { notes[$0].confidence < notes[$1].confidence }) {
+                    members.removeAll { $0 == weakest }
+                }
+                found = enumerateShapes(members)
+            }
+            if found.count > 60 { found = Array(found.sorted { $0.intrinsic < $1.intrinsic }.prefix(60)) }
+            shapes.append(found)
+        }
+
+        let maxPos = max(1, min(17, instrument.maxFret - 3))
+        let positions = Array(1...maxPos)
         let P = positions.count
 
-        /// Cost of playing candidate `c` while the hand is at position `pos` (∞ if unreachable).
-        func reach(_ c: TabPosition, _ pos: Int) -> Double {
-            if c.fret == 0 { return 0.35 }                         // open strings work from anywhere
-            if c.fret >= pos && c.fret <= pos + 3 { return 0 }     // inside the hand
-            if c.fret == pos - 1 || c.fret == pos + 4 { return 1.0 } // small stretch
-            return .infinity
+        /// Cost of a shape with the hand at `pos` (∞ if it can't be reached).
+        func reach(_ sh: Shape, _ pos: Int) -> Double {
+            var c = sh.intrinsic
+            let chord = sh.positions.count > 1
+            for p in sh.positions.values {
+                if p.fret == 0 { c += chord ? 0.1 : 0.35; continue }
+                if p.fret >= pos && p.fret <= pos + 3 { continue }
+                if p.fret == pos - 1 || p.fret == pos + 4 { c += 1.0; continue }
+                return .infinity
+            }
+            return c
         }
-        func bestReach(_ i: Int, _ pos: Int) -> Double {
-            candidates[i].map { reach($0, pos) }.min() ?? .infinity
-        }
-
-        // DP over hand positions.
-        /// Players prefer the lower half of the neck; high positions get progressively more expensive.
         func positionCost(_ pos: Int) -> Double { Double(pos) * 0.08 + Double(max(0, pos - 7)) * 0.25 }
 
-        var cost = positions.map { bestReach(0, $0) + positionCost($0) }
+        let G = groups.count
+        var bestReach = [[Double]](repeating: [Double](repeating: .infinity, count: P), count: G)
+        for gi in 0..<G {
+            for (pi, pos) in positions.enumerated() {
+                bestReach[gi][pi] = shapes[gi].map { reach($0, pos) }.min() ?? 0
+            }
+        }
+        func gStart(_ gi: Int) -> Double { notes[groups[gi][0]].start }
+        func gEnd(_ gi: Int) -> Double { groups[gi].map { notes[$0].end }.max() ?? gStart(gi) }
+
+        var cost = (0..<P).map { bestReach[0][$0] + positionCost(positions[$0]) }
         var back: [[Int]] = [Array(repeating: 0, count: P)]
-        for i in 1..<notes.count {
-            let gap = notes[i].start - notes[i - 1].end
-            let relax = gap > 1.0 ? 0.35 : 1.0      // rests make shifting easy
+        for gi in 1..<max(1, G) {
+            let gap = gStart(gi) - gEnd(gi - 1)
+            let relax = gap > 1.0 ? 0.35 : (gap > 0.3 ? 0.7 : 1.0)      // rests make shifting easy
             var newCost = [Double](repeating: .infinity, count: P)
             var choice = [Int](repeating: 0, count: P)
-            for (pi, pos) in positions.enumerated() {
-                let r = bestReach(i, pos)
+            for pi in 0..<P {
+                let r = bestReach[gi][pi]
                 guard r.isFinite else { continue }
                 var best = Double.infinity, bestJ = 0
-                for (pj, prev) in positions.enumerated() where cost[pj].isFinite {
-                    let move = prev == pos ? 0 : (1.5 + 0.3 * Double(abs(pos - prev))) * relax
-                    let v = cost[pj] + move
-                    if v < best { best = v; bestJ = pj }
+                for pj in 0..<P where cost[pj].isFinite {
+                    let move = pi == pj ? 0 : (1.5 + 0.3 * Double(abs(pi - pj))) * relax
+                    if cost[pj] + move < best { best = cost[pj] + move; bestJ = pj }
                 }
-                newCost[pi] = best + r + positionCost(pos)
+                newCost[pi] = best + r + positionCost(positions[pi])
                 choice[pi] = bestJ
             }
             if newCost.allSatisfy({ !$0.isFinite }) {
-                // unreachable note (shouldn't happen) – restart from any position
-                newCost = positions.map { bestReach(i, $0) + positionCost($0) }
-                choice = Array(repeating: cost.indices.min { cost[$0] < cost[$1] } ?? 0, count: P)
+                let prevBest = cost.indices.min { cost[$0] < cost[$1] } ?? 0
+                newCost = (0..<P).map { bestReach[gi][$0] + positionCost(positions[$0]) }
+                choice = Array(repeating: prevBest, count: P)
             }
             cost = newCost
             back.append(choice)
         }
 
         var pIdx = cost.indices.min { cost[$0] < cost[$1] } ?? 0
-        var handPos = [Int](repeating: 1, count: notes.count)
-        for i in stride(from: notes.count - 1, through: 0, by: -1) {
-            handPos[i] = positions[pIdx]
-            pIdx = back[i][pIdx]
+        var handPos = [Int](repeating: 1, count: G)
+        for gi in stride(from: G - 1, through: 0, by: -1) {
+            handPos[gi] = positions[pIdx]
+            pIdx = back[gi][pIdx]
         }
 
-        // Place each note inside its hand position, keeping string changes small.
-        var result: [TabPosition] = []
+        var result = [TabPosition?](repeating: nil, count: notes.count)
         var prevString: Int?
-        for i in notes.indices {
-            let pos = handPos[i]
-            let best = candidates[i].min { a, b in
-                func score(_ c: TabPosition) -> Double {
-                    reach(c, pos) + (prevString.map { Double(abs(c.string - $0)) * 0.15 } ?? 0)
+        for gi in 0..<G {
+            let pos = handPos[gi]
+            guard let best = shapes[gi].min(by: { a, b in
+                func score(_ s: Shape) -> Double {
+                    reach(s, pos) + (prevString.map { Double(abs(s.lowestString - $0)) * 0.15 } ?? 0)
                 }
                 return score(a) < score(b)
-            } ?? candidates[i][0]
-            result.append(best)
-            prevString = best.string
+            }) else { continue }
+            for (i, p) in best.positions { result[i] = p }
+            prevString = best.lowestString
         }
         return result
     }
 }
+
 
 // MARK: - Export formats
 
@@ -372,7 +549,7 @@ enum MelodyExport {
     /// Plain-text tablature on a 16th-note grid (4 bars per system) with a rhythm line underneath.
     static func asciiTab(track: MelodyTrack, chords: [ChordSegment], title: String, fallbackBPM: Double,
                          transpose: Int, resolution: Int) -> String {
-        let instrument = track.source.tabInstrument
+        let instrument = track.instrument
         let grid = track.grid(fallbackBPM: fallbackBPM)
         let strings = instrument.tuning.count
         let stepsPerBar = 16
@@ -381,7 +558,7 @@ enum MelodyExport {
         var starts: [Double] = [], ends: [Double] = []
         var payload: [(frets: [Int: Int], stroke: String, chord: String)] = []
 
-        if track.source.isRhythm {
+        if track.usesStrums {
             for s in track.strums ?? [] {
                 guard let c = MelodyTrack.chord(at: s.start + 0.02, in: chords),
                       let v = GuitarChords.voicing(root: (c.root + transpose + 12) % 12, quality: c.quality) else { continue }
@@ -392,9 +569,14 @@ enum MelodyExport {
             }
         } else {
             let positions = TabFingering.positions(for: track.notes, instrument: instrument, transpose: transpose)
-            for (n, p) in zip(track.notes, positions) {
-                starts.append(n.start); ends.append(n.end)
-                payload.append(([p.string: p.fret], "", ""))
+            for g in NoteGrouping.groups(track.notes) {
+                var frets: [Int: Int] = [:]
+                for i in g { if let p = positions[i] { frets[p.string] = p.fret } }
+                guard !frets.isEmpty else { continue }
+                starts.append(track.notes[g[0]].start)
+                ends.append(g.map { track.notes[$0].end }.max() ?? track.notes[g[0]].end)
+                let chord = MelodyTrack.chord(at: track.notes[g[0]].start + 0.02, in: chords)?.name(transpose: transpose) ?? ""
+                payload.append((frets, "", track.source.isRhythm ? chord : ""))
             }
         }
         guard !starts.isEmpty else { return "\(title)\n\n(no notes)\n" }
@@ -417,11 +599,11 @@ enum MelodyExport {
         }
 
         var out = "\(title)\n"
-        out += "\(track.source.label) · auto-transcribed by SlowFlowX (approximate)\n"
-        out += "Tempo ≈ \(Int(grid.bpm.rounded())) BPM · \(instrument == .guitar ? "Standard tuning EADGBE" : "Bass EADG")"
+        out += "\(track.source.label) · auto-transcribed by SlowFlowX\(track.usesNeuralModel ? " (Basic Pitch)" : "") – check by ear\n"
+        out += "Tempo ≈ \(Int(grid.bpm.rounded())) BPM · \(instrument.isBass ? "Bass" : "Guitar"), \(instrument.label)"
         if transpose != 0 { out += String(format: " · transposed %+d", transpose) }
         out += "\nRhythm: W whole · H half · Q quarter · E eighth · S sixteenth · . dotted"
-        if track.source.isRhythm { out += " · D/U = down/up strum" }
+        if track.usesStrums { out += " · D/U = down/up strum" }
         out += "\n\n"
 
         func cell(_ s: String) -> String { s.isEmpty ? "   " : s.padding(toLength: 3, withPad: " ", startingAt: 0) }
@@ -461,7 +643,7 @@ enum MelodyExport {
                 rhythm += " "; strokes += " "
             }
             out += rhythm + "\n"
-            if track.source.isRhythm { out += strokes + "\n" }
+            if track.usesStrums { out += strokes + "\n" }
             out += "\n"
             bar = endBar
         }
@@ -489,7 +671,7 @@ enum MelodyExport {
             if let q = quantized, i < q.count {
                 start = grid.time(ofStep: Double(q[i].startStep))
                 end = grid.time(ofStep: Double(q[i].endStep))
-                if track.source.isRhythm { end = max(end, n.end) }   // chord tones share a strum: don't clip
+                if track.usesStrums { end = max(end, n.end) }   // chord tones share a strum: don't clip
             }
             let note = UInt8(clamping: max(0, min(127, n.midi + transpose)))
             let vel = UInt8(clamping: 60 + Int(min(max(n.confidence, 0), 1) * 50))

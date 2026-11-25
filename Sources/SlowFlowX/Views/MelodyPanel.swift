@@ -10,12 +10,12 @@ enum MelodyViewStyle: String, CaseIterable, Identifiable {
 /// Caches tab fingerings so the DP isn't recomputed on every frame.
 @MainActor
 private enum FingeringCache {
-    private static var cache: [String: [TabPosition]] = [:]
+    private static var cache: [String: [TabPosition?]] = [:]
 
-    static func positions(songID: String, track: MelodyTrack, transpose: Int) -> [TabPosition] {
-        let key = "\(songID)|\(track.source.rawValue)|\(transpose)|\(track.analyzedAt.timeIntervalSince1970)|\(track.notes.count)"
+    static func positions(songID: String, track: MelodyTrack, transpose: Int) -> [TabPosition?] {
+        let key = "\(songID)|\(track.source.rawValue)|\(transpose)|\(track.analyzedAt.timeIntervalSince1970)|\(track.notes.count)|\(track.instrument.id)"
         if let p = cache[key] { return p }
-        let p = TabFingering.positions(for: track.notes, instrument: track.source.tabInstrument, transpose: transpose)
+        let p = TabFingering.positions(for: track.notes, instrument: track.instrument, transpose: transpose)
         if cache.count > 40 { cache.removeAll() }
         cache[key] = p
         return p
@@ -100,8 +100,8 @@ struct MelodyPanel: View {
                     case .tab:
                         TabSheetView(events: Self.sheetEvents(song: song, track: track, chords: chords,
                                                               grid: grid, transpose: transpose),
-                                     instrument: track.source.tabInstrument,
-                                     showsStrokes: track.source.isRhythm,
+                                     instrument: track.instrument,
+                                     showsStrokes: track.usesStrums,
                                      chords: chords, grid: grid,
                                      time: player.currentTime, transpose: transpose,
                                      onSeek: { player.seek(to: $0) })
@@ -114,9 +114,7 @@ struct MelodyPanel: View {
                 }
                 .frame(minHeight: 120, maxHeight: .infinity)
                 .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
-                Text(track.source.isRhythm
-                     ? "Strums are detected from attacks in the mix; directions follow the beat (down on the beat, up in between). Chord shapes come from the chord analysis."
-                     : "Auto-transcribed from the mix. Works best when the part is prominent; use it as a starting point and check by ear. Drag to scrub.")
+                Text(footnote(track))
                     .font(.system(size: 10.5))
                     .foregroundStyle(theme.subtextColor)
                     .lineLimit(2)
@@ -157,7 +155,7 @@ struct MelodyPanel: View {
     /// Notes (or strums) placed on the 16th-note grid for the sheet-style tab.
     @MainActor static func sheetEvents(song: Song, track: MelodyTrack, chords: [ChordSegment],
                             grid: RhythmGrid, transpose: Int) -> [SheetEvent] {
-        if track.source.isRhythm {
+        if track.usesStrums {
             let strums = track.strums ?? []
             let q = RhythmQuantizer.quantize(starts: strums.map(\.start), ends: strums.map(\.end), grid: grid, resolution: 1)
             return q.map { e in
@@ -171,13 +169,47 @@ struct MelodyPanel: View {
             }
         }
         let positions = FingeringCache.positions(songID: song.id, track: track, transpose: transpose)
-        let q = RhythmQuantizer.quantize(starts: track.notes.map(\.start), ends: track.notes.map(\.end), grid: grid, resolution: 1)
-        return q.compactMap { e in
-            guard e.index < positions.count else { return nil }
-            let n = track.notes[e.index], p = positions[e.index]
-            return SheetEvent(grid: e, start: n.start, end: n.end, frets: [p.string: p.fret],
-                              mark: p.octaveShift == 0 ? nil : (p.octaveShift > 0 ? "8vb" : "8va"), down: nil)
+        guard positions.count == track.notes.count else { return [] }
+        let groups = NoteGrouping.groups(track.notes)
+        let starts = groups.map { track.notes[$0[0]].start }
+        let ends = groups.map { g in g.map { track.notes[$0].end }.max() ?? track.notes[g[0]].start }
+        let q = RhythmQuantizer.quantize(starts: starts, ends: ends, grid: grid, resolution: 1)
+        let events: [SheetEvent] = q.compactMap { e in
+            var frets: [Int: Int] = [:]
+            var shift = 0
+            for i in groups[e.index] {
+                guard let p = positions[i] else { continue }
+                frets[p.string] = p.fret
+                if p.octaveShift != 0 { shift = p.octaveShift }
+            }
+            guard !frets.isEmpty else { return nil }
+            return SheetEvent(grid: e, start: starts[e.index], end: ends[e.index], frets: frets,
+                              mark: shift == 0 ? nil : (shift > 0 ? "8vb" : "8va"), down: nil)
         }
+        // Slightly staggered attacks that land on the same 16th are one chord on paper.
+        var merged: [SheetEvent] = []
+        for e in events {
+            if let last = merged.last, last.grid.startStep == e.grid.startStep {
+                merged[merged.count - 1] = SheetEvent(grid: last.grid.endStep >= e.grid.endStep ? last.grid : e.grid,
+                                                      start: last.start, end: max(last.end, e.end),
+                                                      frets: last.frets.merging(e.frets) { old, _ in old },
+                                                      mark: last.mark ?? e.mark, down: nil)
+            } else {
+                merged.append(e)
+            }
+        }
+        return merged
+    }
+
+    private func footnote(_ track: MelodyTrack) -> String {
+        if track.usesStrums {
+            return "Older transcription: strum times only, chord shapes from the chord analysis. Use Update Transcription to get the notes that are actually played."
+        }
+        if track.usesNeuralModel {
+            let from = track.stemUsed == nil ? "the full mix (separate stems for much better results)" : "the isolated stem"
+            return "Notes detected by a neural transcription model from \(from), then fingered for \(track.instrument.label). Check by ear and change the tuning if the shapes look odd. Click to jump."
+        }
+        return "Auto-transcribed with the classic single-note tracker (the neural model was not available). Click to jump."
     }
 
     /// Transcribe automatically the first time a part is shown.
@@ -258,7 +290,7 @@ private struct RhythmToolbar: View {
                 }
                 .buttonStyle(GhostButtonStyle(active: true))
                 .help("Stems are available: transcribing from the isolated part is much more accurate")
-            } else if song.stems == nil && !track.source.isRhythm {
+            } else if song.stems == nil {
                 Button {
                     model.separateStems(song.id, engine: model.tools.demucsReady ? .demucs : .builtin)
                 } label: {
@@ -274,7 +306,28 @@ private struct RhythmToolbar: View {
                     Label("Update Transcription", systemImage: "arrow.clockwise")
                 }
                 .buttonStyle(GhostButtonStyle(active: true))
-                .help("This part was transcribed with an older version. Transcribe again for the improved tempo, beat grid, fingering and note detection.")
+                .help("This part was transcribed with an older version. Transcribe again to use the neural note model (real chords and riffs, playable fingering).")
+            }
+
+            if track.source != .vocal && !track.usesStrums {
+                let current = track.instrument
+                Menu {
+                    Section(track.tuningUserSet == true ? "Tuning" : "Tuning (detected from the lowest notes)") {
+                        ForEach(Tuning.presets(bass: current.isBass)) { t in
+                            Button {
+                                model.setTuning(song.id, source: track.source, tuningID: t.id)
+                            } label: {
+                                if t.id == current.id { Label(t.label, systemImage: "checkmark") } else { Text(t.label) }
+                            }
+                        }
+                    }
+                } label: {
+                    Text(current.label)
+                        .font(.system(size: 11.5, weight: .semibold))
+                }
+                .menuStyle(.borderlessButton)
+                .fixedSize()
+                .help("Tuning the tab is written for. Down-tuned songs look unplayable in standard tuning.")
             }
 
             Spacer(minLength: 8)
@@ -333,7 +386,7 @@ private struct NowNoteBar: View {
         let lyricLine: String? = song.lyrics.flatMap { l in l.lineIndex(at: time).map { l.lines[$0].text } }
 
         HStack(alignment: .center, spacing: 16) {
-            if track.source.isRhythm {
+            if track.usesStrums {
                 rhythmContent
             } else {
                 melodyContent
@@ -345,23 +398,25 @@ private struct NowNoteBar: View {
                     .lineLimit(1)
             }
             Spacer(minLength: 0)
-            Badge(text: "\(track.eventCount) \(track.source.isRhythm ? "strums" : "notes")" + (track.usedMetal ? " · Metal" : ""))
+            Badge(text: "\(track.eventCount) \(track.usesStrums ? "strums" : "notes")"
+                  + (track.usesNeuralModel ? " · Core ML" : (track.usedMetal ? " · Metal" : "")))
         }
         .padding(.horizontal, 12).padding(.vertical, 8)
         .background(RoundedRectangle(cornerRadius: 12, style: .continuous).fill(theme.elevatedColor))
     }
 
     @ViewBuilder private var melodyContent: some View {
-        let idx = track.noteIndex(at: time)
+        let sounding = track.notes.filter { $0.start <= time && time < $0.end }.sorted { $0.midi < $1.midi }
         let nextStart = track.notes.firstIndex { $0.start > time } ?? track.notes.count
-        let upcoming = Array(track.notes[nextStart..<min(track.notes.count, nextStart + 8)])
+        let upcoming = Self.upcomingGroups(track.notes, from: nextStart, limit: 8)
         VStack(alignment: .leading, spacing: 0) {
-            Text("NOTE")
+            Text(sounding.count > 1 ? "NOTES" : "NOTE")
                 .font(.system(size: 10, weight: .semibold)).tracking(1.2)
                 .foregroundStyle(theme.subtextColor)
-            Text(idx.map { track.notes[$0].name(transpose: transpose) } ?? "rest")
-                .font(.system(size: idx == nil ? 18 : 30, weight: .heavy, design: .rounded))
-                .foregroundStyle(idx == nil ? AnyShapeStyle(theme.subtextColor.opacity(0.6)) : AnyShapeStyle(theme.accentGradient))
+            Text(sounding.isEmpty ? "rest" : sounding.prefix(4).map { $0.name(transpose: transpose) }.joined(separator: " "))
+                .font(.system(size: sounding.isEmpty ? 18 : (sounding.count > 1 ? 22 : 30), weight: .heavy, design: .rounded))
+                .foregroundStyle(sounding.isEmpty ? AnyShapeStyle(theme.subtextColor.opacity(0.6)) : AnyShapeStyle(theme.accentGradient))
+                .lineLimit(1)
                 .frame(height: 36, alignment: .leading)
                 .frame(minWidth: 80, alignment: .leading)
         }
@@ -369,14 +424,29 @@ private struct NowNoteBar: View {
             Text("NEXT")
                 .font(.system(size: 10, weight: .semibold)).tracking(1.2)
                 .foregroundStyle(theme.subtextColor)
-            ForEach(upcoming) { n in
-                Text(n.name(transpose: transpose))
+            ForEach(Array(upcoming.enumerated()), id: \.offset) { _, g in
+                Text(g.map { $0.name(transpose: transpose) }.joined(separator: "·"))
                     .font(.system(size: 11.5, weight: .semibold, design: .rounded))
                     .foregroundStyle(theme.textColor)
+                    .lineLimit(1)
                     .padding(.horizontal, 7).padding(.vertical, 3)
-                    .background(Capsule().fill(theme.chordColor(root: ((n.midi + transpose) % 12 + 12) % 12).opacity(0.22)))
+                    .background(Capsule().fill(theme.chordColor(root: ((g[0].midi + transpose) % 12 + 12) % 12).opacity(0.22)))
             }
         }
+    }
+
+    /// The next few note events (notes starting together form one chord), low → high.
+    static func upcomingGroups(_ notes: [MelodyNote], from start: Int, limit: Int) -> [[MelodyNote]] {
+        var out: [[MelodyNote]] = []
+        var i = start
+        while i < notes.count && out.count < limit {
+            var g = [notes[i]]
+            var j = i + 1
+            while j < notes.count && notes[j].start - notes[i].start <= NoteGrouping.tolerance { g.append(notes[j]); j += 1 }
+            out.append(g.sorted { $0.midi < $1.midi })
+            i = j
+        }
+        return out
     }
 
     @ViewBuilder private var rhythmContent: some View {
@@ -597,7 +667,7 @@ private struct SheetLayout {
     let showsStrokes: Bool
     let currentStep: Double
 
-    let left: CGFloat = 24
+    let left: CGFloat = 28
     let gap: CGFloat = 13
     var chordRow: CGFloat { 16 }
     var strokeRow: CGFloat { showsStrokes ? 14 : 0 }

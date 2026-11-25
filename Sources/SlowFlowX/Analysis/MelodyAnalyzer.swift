@@ -12,6 +12,27 @@ final class MelodyAnalyzer {
     let centsPerBin: Double = 20
     let maxFreq: Double = 4200
     let chunkFrames = 2048
+    var useNeuralModel = true
+
+    /// Polyphonic transcription with Basic Pitch (Core ML / Neural Engine).
+    private func analyzeNeural(_ x: [Float], model: BasicPitch, source: MelodySource, rhythmURL: URL?, tempoHint: Double?,
+                               progress: @escaping (String, Double) -> Void) throws -> MelodyTrack {
+        progress("Detecting notes (neural model)", 0.05)
+        let raw = try model.transcribe(x, options: .forPart(source)) { p in
+            progress("Detecting notes (neural model)", 0.05 + 0.83 * p)
+        }
+        progress("Cleaning up the part", 0.9)
+        let notes = NoteCleanup.clean(raw, source: source)
+        progress("Finding the beat", 0.95)
+        let (tempo, beatOffset) = beatGrid(fallback: x, rhythmURL: rhythmURL, tempoHint: tempoHint)
+        let tuning: Tuning? = source == .vocal ? nil : Tuning.suggest(for: notes, bass: source == .bass)
+        progress("Done", 1)
+        var track = MelodyTrack(source: source, notes: notes, analyzedAt: Date(), usedMetal: false,
+                                bpm: tempo, beatOffset: beatOffset, strums: nil)
+        track.tuningID = tuning?.id
+        track.engine = "basic-pitch"
+        return track
+    }
 
     /// - Parameters:
     ///   - url: audio to transcribe (ideally the isolated stem)
@@ -23,6 +44,15 @@ final class MelodyAnalyzer {
         progress("Decoding audio", 0.02)
         let x = try AudioLoader.loadMono(url: url, sampleRate: sampleRate)
         guard x.count > fftSize * 2 else { throw AnalysisError.tooShort }
+
+        // Preferred: the neural polyphonic transcriber (real chords, accurate pitches and onsets).
+        if useNeuralModel, let bp = try? BasicPitch.shared() {
+            do {
+                return try analyzeNeural(x, model: bp, source: source, rhythmURL: rhythmURL, tempoHint: tempoHint, progress: progress)
+            } catch {
+                NSLog("SlowFlowX: Basic Pitch failed, using the classic tracker: \(error)")
+            }
+        }
 
         if source.isRhythm { return analyzeRhythm(x, rhythmURL: rhythmURL, tempoHint: tempoHint, progress: progress) }
 
